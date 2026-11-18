@@ -575,6 +575,94 @@ button:disabled { opacity: .4; cursor: default; }
 .run-out .exit.ok { color: var(--ok); }
 .run-out .exit.fail { color: var(--bad); }
 
+/* ---------------- verify panel ---------------- */
+
+.pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+}
+.check-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.check-title {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--faint);
+}
+.check-state { font-size: 10.5px; color: var(--dim); }
+.check-state.passed { color: var(--ok); }
+.check-state.failed { color: var(--bad); }
+.check-state.stale { color: var(--accent); }
+.check-list {
+  display: grid;
+  gap: 4px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.check-item {
+  display: flex;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+  word-break: break-all;
+}
+.check-item .mark { color: var(--faint); flex: 0 0 auto; }
+.check-item.ok .mark { color: var(--ok); }
+.check-item.ng .mark { color: var(--bad); }
+.check-empty {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+}
+.check-empty button {
+  margin-left: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--accent);
+  border: 1px dashed var(--accent-dim);
+  border-radius: 3px;
+  padding: 1px 6px;
+}
+.run-sep {
+  padding: 7px 10px 3px;
+  font-size: 9.5px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.check-badge {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+.check-badge.passed { color: var(--ok); }
+.check-badge.failed { color: var(--bad); }
+.check-badge.stale { color: var(--accent); }
+
+.sheet-note { margin: -8px 0 0; font-size: 11px; color: var(--faint); }
+.suggest { display: grid; gap: 5px; }
+.suggest-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.suggest-list button {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 3px 7px;
+  border: 1px dashed var(--line-2);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-2);
+}
+.suggest-list button:hover { border-color: var(--accent-dim); color: var(--accent); }
+
 /* ---------------- modal ---------------- */
 
 .modal {

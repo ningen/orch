@@ -20,6 +20,9 @@ const state = {
   connected: false,
   everConnected: false,
   browse: null,
+  settings: null,
+  behind: {},
+  unseen: 0,
 };
 
 /* ------------------------------------------------------------------ api */
@@ -112,6 +115,11 @@ function renderRail() {
     const time = el("span");
     time.textContent = ago(task.updatedAt || task.createdAt);
     sub.append(branch, time);
+    if (task.verify && task.verify.status) {
+      const badge = el("span", `check-badge ${task.verify.status}`);
+      badge.textContent = task.verify.status === "passed" ? "verified" : "failed";
+      sub.append(badge);
+    }
 
     row.append(top, sub);
     row.addEventListener("click", () => selectTask(task.id));
@@ -208,6 +216,9 @@ function renderHeader() {
   }
   select.disabled = !(task.models || []).length;
   select.title = task.model || "";
+
+  renderChecks();
+  renderChangesActions();
 
   const busy = task.status === "running" || task.status === "waiting";
   $("cancel").hidden = !busy;
@@ -353,7 +364,7 @@ function paint(item) {
     const title = el("span", "tool-title");
     title.textContent = item.title || "tool";
     const kind = el("span", "tool-kind");
-    kind.textContent = item.toolKind || "";
+    kind.textContent = item.toolKind && item.toolKind !== item.title ? item.toolKind : "";
     const badge = el("span", `tool-state ${item.status}`);
     badge.textContent = item.status;
     const paths = el("span", "tool-paths");
@@ -437,7 +448,9 @@ function handle(event) {
     case "task": {
       const repo = state.repos.get(event.repo);
       if (!repo || !event.task) return;
+      const previous = repo.tasks.get(event.task.id);
       repo.tasks.set(event.task.id, event.task);
+      if (previous) notify(event.task, previous.status);
       scheduleRail();
       if (event.repo === state.currentRepo && event.task.id === state.current) renderHeader();
       return;
@@ -488,6 +501,7 @@ async function loadTask(id) {
   const repo = state.repos.get(state.currentRepo);
   if (repo) repo.tasks.set(id, data.task);
   state.items = data.items || [];
+  state.behind[id] = data.behind || 0;
   renderStream();
   renderHeader();
   loadDiff();
@@ -618,6 +632,164 @@ async function openRepo(path) {
     await refresh();
   } catch (error) {
     toast(error.message, true);
+  }
+}
+
+/* --------------------------------------------------------------- checks */
+
+function notify(task, previous) {
+  const finished = task.status === "done" || task.status === "error";
+  const wasRunning = previous === "running" || previous === "waiting";
+  if (!finished || !wasRunning) return;
+  if (!document.hidden && task.id === state.current) return;
+  state.unseen += 1;
+  document.title = `(${state.unseen}) orch`;
+  if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+    const note = new Notification(task.title, {
+      body: task.status === "error" ? "failed" : "finished",
+      tag: task.id,
+    });
+    note.onclick = () => {
+      window.focus();
+      selectTask(task.id);
+    };
+  }
+}
+
+function renderChecks() {
+  const repo = activeRepo();
+  const task = repo && state.current ? repo.tasks.get(state.current) : null;
+  const checks = (state.settings && state.settings.checks) || [];
+  const list = $("check-list");
+  if (!list) return;
+  list.textContent = "";
+
+  if (!checks.length) {
+    const empty = el("div", "check-empty");
+    empty.textContent = "no checks configured";
+    const add = el("button");
+    add.type = "button";
+    add.textContent = "set up";
+    add.addEventListener("click", openSettings);
+    empty.appendChild(add);
+    list.appendChild(empty);
+  } else {
+    const results = (task && task.verify && task.verify.commands) || [];
+    checks.forEach((command, index) => {
+      const row = el("div", "check-item");
+      const result = results[index];
+      const mark = el("span", "mark");
+      mark.textContent = result ? (result.code === 0 ? "ok" : "ng") : "·";
+      if (result) row.classList.add(result.code === 0 ? "ok" : "ng");
+      const text = el("span");
+      text.textContent = command;
+      row.append(mark, text);
+      list.appendChild(row);
+    });
+  }
+
+  const line = $("check-state");
+  if (!line) return;
+  line.className = "check-state mono";
+  if (!task || !task.verify) {
+    line.textContent = checks.length ? "not run" : "";
+  } else {
+    line.textContent = `${task.verify.status} · ${ago(task.verify.at)}`;
+    line.classList.add(task.verify.status);
+  }
+  $("check-run").disabled = !checks.length || !task || task.status === "running";
+}
+
+function renderChangesActions() {
+  const task = state.current ? (activeRepo() || { tasks: new Map() }).tasks.get(state.current) : null;
+  const behind = state.current ? (state.behind[state.current] || 0) : 0;
+  $("rebase").hidden = !(behind > 0 && task);
+  $("rebase").textContent = `rebase +${behind}`;
+  $("reset").disabled = !task;
+  $("copy-path").disabled = !task;
+}
+
+async function loadSettings() {
+  if (!state.currentRepo) {
+    state.settings = null;
+    return;
+  }
+  try {
+    state.settings = await api(`/api/settings?repo=${encodeURIComponent(state.currentRepo)}`);
+  } catch (error) {
+    state.settings = null;
+    toast(error.message, true);
+  }
+}
+
+function openSettings() {
+  if (!state.currentRepo) {
+    openRepoModal();
+    return;
+  }
+  const settings = state.settings || { checks: [], deny: [], suggested: [] };
+  $("settings-modal").hidden = false;
+  $("settings-path").textContent = settings.dir || "~/.orch";
+  $("settings-checks").value = (settings.checks || []).join("\n");
+  $("settings-deny").value = (settings.deny || []).join("\n");
+
+  const wrap = $("settings-suggest");
+  const list = $("suggest-list");
+  list.textContent = "";
+  const suggested = (settings.suggested || []).filter(
+    (command) => !(settings.checks || []).includes(command),
+  );
+  wrap.hidden = !suggested.length;
+  for (const command of suggested) {
+    const chip = el("button");
+    chip.type = "button";
+    chip.textContent = command;
+    chip.addEventListener("click", () => {
+      const box = $("settings-checks");
+      box.value = box.value.trim() ? `${box.value.trim()}\n${command}` : command;
+    });
+    list.appendChild(chip);
+  }
+  setTimeout(() => $("settings-checks").focus(), 20);
+}
+
+function closeSettings() {
+  $("settings-modal").hidden = true;
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const lines = (id) =>
+    $(id)
+      .value.split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        repo: state.currentRepo,
+        checks: lines("settings-checks"),
+        deny: lines("settings-deny"),
+      }),
+    });
+    await loadSettings();
+    closeSettings();
+    renderChecks();
+    toast("checks saved");
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function copyPath() {
+  const task = state.current ? (activeRepo() || { tasks: new Map() }).tasks.get(state.current) : null;
+  if (!task) return;
+  try {
+    await navigator.clipboard.writeText(task.worktree);
+    toast("worktree path copied");
+  } catch {
+    toast(task.worktree);
   }
 }
 
@@ -808,6 +980,7 @@ async function refresh() {
     state.currentRepo =
       data.current && repos.has(data.current) ? data.current : (repos.keys().next().value || null);
 
+    await loadSettings();
     renderRepoLabel();
     renderRail();
 
@@ -912,6 +1085,46 @@ function wire() {
   });
 
   $("refresh-diff").addEventListener("click", loadDiff);
+  $("copy-path").addEventListener("click", copyPath);
+
+  $("check-edit").addEventListener("click", openSettings);
+  $("settings-cancel").addEventListener("click", closeSettings);
+  $("settings-form").addEventListener("submit", saveSettings);
+  $("settings-modal").addEventListener("click", (event) => {
+    if (event.target === $("settings-modal")) closeSettings();
+  });
+
+  $("check-run").addEventListener("click", async () => {
+    if (!state.current) return;
+    try {
+      await api(`/api/tasks/${state.current}/verify`, { method: "POST" });
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+
+  $("rebase").addEventListener("click", async () => {
+    if (!state.current) return;
+    try {
+      const data = await api(`/api/tasks/${state.current}/rebase`, { method: "POST" });
+      toast(data.message || "rebased");
+      await loadTask(state.current);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+
+  $("reset").addEventListener("click", async () => {
+    if (!state.current) return;
+    if (!window.confirm("Discard every change in this worktree?")) return;
+    try {
+      const data = await api(`/api/tasks/${state.current}/reset`, { method: "POST" });
+      toast(data.message || "reset");
+      await loadTask(state.current);
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
 
   $("run-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -934,7 +1147,7 @@ function wire() {
       for (const other of document.querySelectorAll(".tab")) other.classList.remove("active");
       tab.classList.add("active");
       $("pane-changes").hidden = tab.dataset.tab !== "changes";
-      $("pane-run").hidden = tab.dataset.tab !== "run";
+      $("pane-run").hidden = tab.dataset.tab !== "verify";
       if (tab.dataset.tab === "changes") loadDiff();
     });
   }
@@ -949,7 +1162,8 @@ function wire() {
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      if (!$("repo-modal").hidden) closeRepoModal();
+      if (!$("settings-modal").hidden) closeSettings();
+      else if (!$("repo-modal").hidden) closeRepoModal();
       else if (!$("modal").hidden) closeModal();
       return;
     }
@@ -987,6 +1201,17 @@ async function boot() {
   connect();
   await refresh();
   autoSize();
+  if (typeof Notification !== "undefined" && Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
+  const clearBadge = () => {
+    state.unseen = 0;
+    document.title = "orch";
+  };
+  window.addEventListener("focus", clearBadge);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) clearBadge();
+  });
   setInterval(() => {
     if (state.repos.size) renderRail();
   }, 60000);

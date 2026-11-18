@@ -27,6 +27,16 @@ type Task = {
   usage: Usage | null;
   createdAt: number;   // unix millis
   updatedAt: number;
+  baseRef: string;     // branch this task was cut from
+  sessionId: string | null; // agent session, reused after a restart
+  verify: Verify | null;
+};
+
+type Verify = {
+  status: "passed" | "failed";
+  at: number;
+  fingerprint: string;         // worktree contents this result describes
+  commands: { command: string; code: number }[];
 };
 
 // Ordered transcript entries. Items are upserted by `id`.
@@ -62,10 +72,15 @@ type Item =
 | POST | `/api/tasks/{id}/prompt` | `{ text }` | `{ ok: true }` |
 | POST | `/api/tasks/{id}/cancel` | – | `{ ok: true }` |
 | POST | `/api/tasks/{id}/model` | `{ value }` | `{ task }` |
-| POST | `/api/tasks/{id}/merge` | – | `{ ok, message }` |
+| POST | `/api/tasks/{id}/merge` | – | commit, then merge when the repository is clean |
+| POST | `/api/tasks/{id}/verify` | – | run the repository's checks (result on SSE) |
+| POST | `/api/tasks/{id}/rebase` | – | replay onto the base branch, aborting on conflict |
+| POST | `/api/tasks/{id}/reset` | – | discard the worktree and return to the base commit |
 | DELETE | `/api/tasks/{id}` | – | `{ ok: true }` |
 | GET | `/api/tasks/{id}/diff` | – | `{ stat, diff }` (unified diff vs. merge base) |
 | POST | `/api/tasks/{id}/run` | `{ command }` | `{ ok: true }` (output arrives on SSE) |
+| GET | `/api/settings?repo=` | – | `{ repo, dir, checks, deny, suggested }` |
+| PUT | `/api/settings` | `{ repo?, checks, deny }` | same shape as `GET` |
 | GET | `/api/events` | – | `text/event-stream` |
 
 `RepoSummary` is what `/api/state` returns per open repository:
@@ -112,5 +127,16 @@ Clients should reconnect automatically (EventSource does this) and re-fetch
   turn ends normally.
 - `GET /api/tasks/{id}/diff` compares the worktree against the merge base with
   the repo's default branch, so it shows everything the task changed.
+- `GET /api/tasks/{id}` also returns `behind`: how many commits the base branch
+  has that this task does not.
+- Verification settings live in the daemon's state directory
+  (`<project>/settings.json`), never in the repository: an agent must not be
+  able to edit the gate that judges it. `suggested` is a guess derived from
+  marker files (`flake.nix`, `Cargo.toml`, ...).
+- Checks are run in order inside the worktree. A configured check that has not
+  passed against the current worktree blocks `merge`; changing a file after a
+  passing run invalidates it.
+- `deny` patterns are refused for commands the daemon executes (verify, run).
+  They do not constrain an agent that runs tools on its own.
 - `POST /api/tasks/{id}/run` runs a shell command in the task worktree and
   streams `stdout`/`stderr` on SSE, finishing with a `stream: "exit"` frame.

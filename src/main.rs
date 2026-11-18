@@ -6,6 +6,7 @@
 
 mod acp;
 mod server;
+mod settings;
 mod task;
 
 use anyhow::{Context, Result};

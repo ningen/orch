@@ -81,15 +81,29 @@
   <aside class="inspector" id="inspector">
     <div class="tabs">
       <button class="tab active" data-tab="changes">changes</button>
-      <button class="tab" data-tab="run">run</button>
-      <span class="spacer"></span>
-      <button class="icon-btn" id="refresh-diff" title="Refresh diff">refresh</button>
+      <button class="tab" data-tab="verify">verify</button>
     </div>
     <div class="pane" id="pane-changes">
+      <div class="pane-actions">
+        <button class="icon-btn" id="refresh-diff">refresh</button>
+        <button class="icon-btn" id="rebase" hidden>rebase</button>
+        <button class="icon-btn" id="reset">reset</button>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="copy-path">copy path</button>
+      </div>
       <div class="diff-meta mono" id="diff-meta"></div>
       <pre class="diff mono" id="diff"></pre>
     </div>
     <div class="pane" id="pane-run" hidden>
+      <div class="check-head">
+        <span class="check-title mono">checks</span>
+        <span class="check-state mono" id="check-state"></span>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="check-edit">edit</button>
+        <button class="btn" id="check-run">verify</button>
+      </div>
+      <div class="check-list" id="check-list"></div>
+      <div class="run-sep mono">run a command</div>
       <form class="run-form" id="run-form">
         <input id="run-cmd" class="mono" value="nix build" spellcheck="false" autocomplete="off">
         <button class="btn" type="submit">run</button>
@@ -149,6 +163,31 @@
       <button type="button" class="btn ghost" id="repo-cancel">close</button>
     </div>
   </div>
+</div>
+
+<div class="modal" id="settings-modal" hidden>
+  <form class="sheet" id="settings-form">
+    <h2>Checks</h2>
+    <p class="sheet-note">Kept in <span class="mono" id="settings-path"></span> — not in the repository, so an agent cannot rewrite its own gate.</p>
+    <label class="field">
+      <span class="label">verify commands <em>one per line, run in order</em></span>
+      <textarea id="settings-checks" rows="6" class="mono" spellcheck="false"></textarea>
+    </label>
+    <div class="suggest" id="settings-suggest" hidden>
+      <span class="label">suggested</span>
+      <div class="suggest-list" id="suggest-list"></div>
+    </div>
+    <label class="field">
+      <span class="label">refuse to run <em>one pattern per line</em></span>
+      <textarea id="settings-deny" rows="3" class="mono" spellcheck="false"></textarea>
+    </label>
+    <div class="sheet-foot">
+      <span class="hint mono">esc to close</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="settings-cancel">cancel</button>
+      <button type="submit" class="btn primary">save</button>
+    </div>
+  </form>
 </div>
 
 <div class="toast" id="toast" hidden></div>

@@ -1,5 +1,6 @@
 //! HTTP surface: JSON API, SSE event stream, and the embedded UI.
 
+use crate::settings::Settings;
 use crate::task::Orch;
 use anyhow::anyhow;
 use axum::{
@@ -18,9 +19,7 @@ use std::convert::Infallible;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::broadcast;
-use tokio::sync::mpsc;
 
 const INDEX: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");
@@ -46,6 +45,10 @@ pub fn router(orch: Arc<Orch>) -> Router {
         .route("/api/tasks/{id}/cancel", post(cancel))
         .route("/api/tasks/{id}/model", post(set_model))
         .route("/api/tasks/{id}/merge", post(merge))
+        .route("/api/tasks/{id}/verify", post(verify))
+        .route("/api/tasks/{id}/rebase", post(rebase))
+        .route("/api/tasks/{id}/reset", post(reset))
+        .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/tasks/{id}/diff", get(diff))
         .route("/api/tasks/{id}/run", post(run))
         .with_state(orch)
@@ -201,7 +204,10 @@ fn home_dir() -> PathBuf {
 async fn show(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
     let task = need_task(&orch, &id).await?;
     let (meta, items) = task.snapshot().await;
-    Ok(Json(json!({ "task": meta, "items": items })))
+    let behind = task.behind().await;
+    Ok(Json(
+        json!({ "task": meta, "items": items, "behind": behind }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -277,8 +283,23 @@ async fn set_model(
 
 async fn merge(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
     let task = need_task(&orch, &id).await?;
-    let result = task.commit().await?;
-    Ok(Json(result))
+    Ok(Json(task.merge().await?))
+}
+
+async fn verify(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
+    task.verify().await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn rebase(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
+    Ok(Json(task.rebase().await?))
+}
+
+async fn reset(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
+    Ok(Json(task.reset().await?))
 }
 
 async fn diff(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
@@ -308,102 +329,99 @@ async fn run(
     Json(body): Json<RunBody>,
 ) -> Api<Value> {
     let task = need_task(&orch, &id).await?;
-    // A verification command usually reads the index (nix flakes do), so make
-    // freshly written files visible before running it.
-    task.stage_intent().await.ok();
-    let (meta, _) = task.snapshot().await;
     let command = body.command.trim().to_string();
     if command.is_empty() {
         return Err(ApiError(anyhow!("command is empty")));
     }
+    // Refuse anything the repository settings marked as out of bounds.
+    task.settings().await.check_command(&command)?;
+    task.stage_intent().await.ok();
+
     let run_id = format!("r_{}", uuid::Uuid::new_v4().simple());
-    let task_run = run_id.clone();
-
+    let spawned = task.clone();
+    let rid = run_id.clone();
     tokio::spawn(async move {
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(&command)
-            .current_dir(&meta.worktree)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                task.emit(json!({
-                    "type": "run", "taskId": meta.id, "runId": task_run,
-                    "stream": "stderr", "text": format!("{e}\n")
-                }));
-                task.emit(json!({
-                    "type": "run", "taskId": meta.id, "runId": task_run,
-                    "stream": "exit", "text": "", "code": -1
-                }));
-                return;
-            }
-        };
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let (tx, mut rx) = mpsc::channel::<(String, String)>(256);
-
-        if let Some(out) = stdout {
-            let tx = tx.clone();
-            tokio::spawn(pump_pipe(out, "stdout", tx));
+        if let Err(error) = spawned.exec(&command, &rid).await {
+            eprintln!("run failed: {error:#}");
         }
-        if let Some(err) = stderr {
-            let tx = tx.clone();
-            tokio::spawn(pump_pipe(err, "stderr", tx));
-        }
-        drop(tx);
-
-        let emitter = task.clone();
-        let task_id = meta.id.clone();
-        let run_id = task_run.clone();
-        let drain = tokio::spawn(async move {
-            while let Some((stream, text)) = rx.recv().await {
-                emitter.emit(json!({
-                    "type": "run", "taskId": task_id, "runId": run_id,
-                    "stream": stream, "text": text
-                }));
-            }
-        });
-
-        let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
-        let _ = drain.await;
-        task.emit(json!({
-            "type": "run", "taskId": meta.id, "runId": task_run,
-            "stream": "exit", "text": "", "code": code
-        }));
     });
-
     Ok(Json(json!({ "ok": true, "runId": run_id })))
 }
 
-async fn pump_pipe<R>(mut pipe: R, name: &'static str, tx: mpsc::Sender<(String, String)>)
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = [0u8; 4096];
-    let mut pending = String::new();
-    loop {
-        match pipe.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                pending.push_str(&String::from_utf8_lossy(&buf[..n]));
-                while let Some(idx) = pending.find('\n') {
-                    let line: String = pending.drain(..=idx).collect();
-                    if tx.send((name.to_string(), line)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            Err(_) => break,
-        }
+/* ---------------------------------------------------------------- settings */
+
+#[derive(Deserialize)]
+struct SettingsQuery {
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+async fn resolve_repo(orch: &Arc<Orch>, wanted: Option<String>) -> Result<String, ApiError> {
+    match wanted {
+        Some(path) => Ok(path),
+        None => orch
+            .current_path()
+            .await
+            .ok_or_else(|| ApiError(anyhow!("no repository is selected"))),
     }
-    if !pending.is_empty() {
-        let _ = tx.send((name.to_string(), pending)).await;
-    }
+}
+
+async fn get_settings(
+    State(orch): State<Arc<Orch>>,
+    Query(query): Query<SettingsQuery>,
+) -> Api<Value> {
+    let path = resolve_repo(&orch, query.repo).await?;
+    let ws = orch
+        .workspace(&path)
+        .await
+        .ok_or_else(|| ApiError(anyhow!("that repository is not open: {path}")))?;
+    let settings = ws.settings.read().await.clone();
+    let suggested = Settings::suggested(FsPath::new(&ws.repo.path));
+    Ok(Json(json!({
+        "repo": path,
+        "dir": ws.dir,
+        "checks": settings.checks,
+        "deny": settings.deny,
+        "suggested": suggested,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SettingsBody {
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    checks: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+async fn put_settings(State(orch): State<Arc<Orch>>, Json(body): Json<SettingsBody>) -> Api<Value> {
+    let path = resolve_repo(&orch, body.repo).await?;
+    let ws = orch
+        .workspace(&path)
+        .await
+        .ok_or_else(|| ApiError(anyhow!("that repository is not open: {path}")))?;
+
+    let settings = Settings {
+        checks: body
+            .checks
+            .into_iter()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect(),
+        deny: body
+            .deny
+            .into_iter()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+    };
+    settings.save(&ws.dir)?;
+    *ws.settings.write().await = settings.clone();
+    Ok(Json(
+        json!({ "checks": settings.checks, "deny": settings.deny }),
+    ))
 }
 
 /* ------------------------------------------------------------------ events */

@@ -5,10 +5,12 @@
 //! open at once, and their tasks keep running while you switch between them.
 
 use crate::acp::{self, Acp, Incoming};
+use crate::settings::Settings;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -43,6 +45,27 @@ pub struct TaskMeta {
     pub usage: Option<Value>,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Branch this task was cut from, used for "behind" and rebase.
+    #[serde(default)]
+    pub base_ref: String,
+    /// Agent session to resume after a restart.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Result of the last verification run.
+    #[serde(default)]
+    pub verify: Option<Verify>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Verify {
+    /// "passed" or "failed".
+    pub status: String,
+    pub at: u64,
+    /// Fingerprint of the working tree that produced this result.
+    pub fingerprint: String,
+    #[serde(default)]
+    pub commands: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,6 +99,7 @@ pub struct Workspace {
     orch: Weak<Orch>,
     models: RwLock<Vec<Value>>,
     default_model: RwLock<Option<String>>,
+    pub settings: RwLock<Settings>,
 }
 
 pub struct Task {
@@ -87,6 +111,9 @@ pub struct Task {
     spawn_lock: Mutex<()>,
     busy: AtomicBool,
     restored: AtomicBool,
+    /// True while an ACP session is being resumed, when replayed history must
+    /// not be appended to the transcript again.
+    replaying: AtomicBool,
 }
 
 pub fn now_ms() -> u64 {
@@ -305,6 +332,7 @@ impl Workspace {
         let (_, branch, _) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
 
         let dir = project_dir(&path);
+        let settings = Settings::load(&dir);
         let tasks_dir = dir.join("tasks");
         std::fs::create_dir_all(&tasks_dir)?;
         std::fs::create_dir_all(dir.join("worktrees"))?;
@@ -320,6 +348,7 @@ impl Workspace {
             orch: Arc::downgrade(orch),
             models: RwLock::new(Vec::new()),
             default_model: RwLock::new(None),
+            settings: RwLock::new(settings),
         });
 
         let mut map = BTreeMap::new();
@@ -350,6 +379,7 @@ impl Workspace {
                 spawn_lock: Mutex::new(()),
                 busy: AtomicBool::new(false),
                 restored: AtomicBool::new(true),
+                replaying: AtomicBool::new(false),
             });
             map.insert(stored.task.id.clone(), task);
         }
@@ -421,6 +451,9 @@ impl Workspace {
                 usage: None,
                 created_at: ts,
                 updated_at: ts,
+                base_ref: self.repo.branch.clone(),
+                session_id: None,
+                verify: None,
             }),
             items: RwLock::new(Vec::new()),
             ws: Arc::downgrade(self),
@@ -429,6 +462,7 @@ impl Workspace {
             spawn_lock: Mutex::new(()),
             busy: AtomicBool::new(false),
             restored: AtomicBool::new(false),
+            replaying: AtomicBool::new(false),
         });
 
         self.tasks.write().await.insert(id.clone(), task.clone());
@@ -665,21 +699,52 @@ impl Task {
         .await
         .map_err(|_| anyhow!("the agent did not answer initialize"))??;
 
-        let session = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            acp.request(
-                "session/new",
-                json!({ "cwd": meta.worktree, "mcpServers": [] }),
-            ),
-        )
-        .await
-        .map_err(|_| anyhow!("the agent did not create a session"))??;
+        let can_load = init
+            .get("agentCapabilities")
+            .and_then(|c| c.get("loadSession"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-        let sid = session
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("agent returned no sessionId"))?
-            .to_string();
+        // Prefer resuming the previous session so a restart does not throw
+        // away the conversation. Replayed history is dropped by the guard in
+        // `on_update`.
+        let mut session = Value::Null;
+        let mut sid = String::new();
+        if can_load {
+            if let Some(previous) = meta.session_id.clone() {
+                self.replaying.store(true, Ordering::SeqCst);
+                let loaded = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    acp.request(
+                        "session/load",
+                        json!({ "sessionId": previous, "cwd": meta.worktree, "mcpServers": [] }),
+                    ),
+                )
+                .await;
+                self.replaying.store(false, Ordering::SeqCst);
+                if let Ok(Ok(value)) = loaded {
+                    session = value;
+                    sid = previous;
+                }
+            }
+        }
+
+        if sid.is_empty() {
+            session = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                acp.request(
+                    "session/new",
+                    json!({ "cwd": meta.worktree, "mcpServers": [] }),
+                ),
+            )
+            .await
+            .map_err(|_| anyhow!("the agent did not create a session"))??;
+            sid = session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("agent returned no sessionId"))?
+                .to_string();
+        }
 
         let models = session
             .get("configOptions")
@@ -735,14 +800,24 @@ impl Task {
         }
 
         *self.agent.lock().await = Some(acp.clone());
-        *self.session.write().await = Some(sid);
+        *self.session.write().await = Some(sid.clone());
+
+        {
+            let mut m = self.meta.write().await;
+            if m.session_id.as_deref() != Some(sid.as_str()) {
+                m.session_id = Some(sid);
+                m.updated_at = now_ms();
+                let snapshot = m.clone();
+                drop(m);
+                self.emit(json!({ "type": "task", "task": snapshot }));
+            }
+        }
 
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             pump(weak, rx).await;
         });
 
-        let _ = init;
         Ok(acp)
     }
 
@@ -800,6 +875,9 @@ impl Task {
     }
 
     async fn on_update(self: &Arc<Self>, params: Value) {
+        if self.replaying.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(update) = params.get("update") else {
             return;
         };
@@ -987,25 +1065,370 @@ impl Task {
         Ok(json!({ "stat": stat, "diff": diff }))
     }
 
-    pub async fn commit(&self) -> Result<Value> {
+    pub async fn settings(&self) -> Settings {
+        match self.ws.upgrade() {
+            Some(ws) => ws.settings.read().await.clone(),
+            None => Settings::default(),
+        }
+    }
+
+    /// Run a shell command in the worktree, streaming its output.
+    ///
+    /// Returns the exit code and a bounded tail of everything printed, which
+    /// is what the verification cards keep.
+    pub async fn exec(self: &Arc<Self>, command: &str, run_id: &str) -> Result<(i32, String)> {
         let (meta, _) = self.snapshot().await;
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(&meta.worktree)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.emit(json!({
+                    "type": "run", "taskId": meta.id, "runId": run_id,
+                    "stream": "stderr", "text": format!("{error}\n")
+                }));
+                self.emit(json!({
+                    "type": "run", "taskId": meta.id, "runId": run_id,
+                    "stream": "exit", "text": "", "code": -1
+                }));
+                return Err(error).with_context(|| format!("cannot run `{command}`"));
+            }
+        };
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let (tx, mut rx) = mpsc::channel::<(String, String)>(256);
+        if let Some(out) = stdout {
+            let tx = tx.clone();
+            tokio::spawn(pump_pipe(out, "stdout", tx));
+        }
+        if let Some(err) = stderr {
+            let tx = tx.clone();
+            tokio::spawn(pump_pipe(err, "stderr", tx));
+        }
+        drop(tx);
+
+        let task = self.clone();
+        let task_id = meta.id.clone();
+        let run = run_id.to_string();
+        let drain = tokio::spawn(async move {
+            let mut tail = String::new();
+            while let Some((stream, text)) = rx.recv().await {
+                task.emit(json!({
+                    "type": "run", "taskId": task_id, "runId": run,
+                    "stream": stream, "text": text
+                }));
+                if tail.len() < 64 * 1024 {
+                    tail.push_str(&text);
+                }
+            }
+            tail
+        });
+
+        let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
+        let tail = drain.await.unwrap_or_default();
+        self.emit(json!({
+            "type": "run", "taskId": meta.id, "runId": run_id,
+            "stream": "exit", "text": "", "code": code
+        }));
+        Ok((code, tail))
+    }
+
+    async fn patch_item<F: FnOnce(&mut Value)>(&self, id: &str, patch: F) {
+        let task_id = self.id_str().await;
+        let mut items = self.items.write().await;
+        if let Some(index) = items.iter().position(|i| i["id"] == json!(id)) {
+            patch(&mut items[index]);
+            let item = items[index].clone();
+            drop(items);
+            self.emit(json!({ "type": "item", "taskId": task_id, "item": item }));
+        }
+    }
+
+    /// Stable fingerprint of the worktree contents, used to tell whether a
+    /// passing check still describes what would be committed.
+    pub async fn fingerprint(&self) -> String {
+        let (meta, _) = self.snapshot().await;
+        let wt = PathBuf::from(&meta.worktree);
+        let (_, head, _) = git(&wt, &["rev-parse", "HEAD"]).await.unwrap_or_default();
+        let (_, status, _) = git(&wt, &["status", "--porcelain"])
+            .await
+            .unwrap_or_default();
+        let (_, diff, _) = git(&wt, &["diff", "HEAD"]).await.unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        head.hash(&mut hasher);
+        status.hash(&mut hasher);
+        diff.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    /// How many commits the base branch has that this task does not.
+    pub async fn behind(&self) -> u64 {
+        let (meta, _) = self.snapshot().await;
+        if meta.base_ref.is_empty() {
+            return 0;
+        }
+        let wt = PathBuf::from(&meta.worktree);
+        let range = format!("HEAD..{}", meta.base_ref);
+        let (ok, out, _) = git(&wt, &["rev-list", "--count", &range]).await.unwrap_or((
+            false,
+            String::new(),
+            String::new(),
+        ));
+        if ok {
+            out.trim().parse().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Run every configured check, in order, against the current worktree.
+    pub async fn verify(self: &Arc<Self>) -> Result<()> {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return Err(anyhow!("the agent is still working on this task"));
+        }
+        let task = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = task.run_verify().await {
+                task.push_item(json!({
+                    "kind": "note",
+                    "id": format!("n_{}", uuid::Uuid::new_v4().simple()),
+                    "at": now_ms(),
+                    "text": format!("verify: {error:#}"),
+                    "tone": "error",
+                }))
+                .await;
+            }
+            task.busy.store(false, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+
+    async fn run_verify(self: &Arc<Self>) -> Result<()> {
+        let Some(ws) = self.ws.upgrade() else {
+            return Err(anyhow!("this workspace is closed"));
+        };
+        let settings = ws.settings.read().await.clone();
+        if settings.checks.is_empty() {
+            return Err(anyhow!(
+                "no checks are configured for this repository — add one in the verify panel"
+            ));
+        }
+        for check in &settings.checks {
+            settings.check_command(check)?;
+        }
+
+        // Flake evaluation reads the index, so make new files visible first.
+        self.stage_intent().await.ok();
+        let fingerprint = self.fingerprint().await;
+
+        let id = format!("v_{}", uuid::Uuid::new_v4().simple());
+        self.push_item(json!({
+            "kind": "tool",
+            "id": id,
+            "at": now_ms(),
+            "title": "verify",
+            "toolKind": "verify",
+            "status": "in_progress",
+            "locations": [],
+            "input": { "checks": settings.checks },
+            "output": "",
+        }))
+        .await;
+
+        let mut results = Vec::new();
+        let mut transcript = String::new();
+        let mut failed = false;
+
+        for (index, command) in settings.checks.iter().enumerate() {
+            let run_id = format!("{id}-{index}");
+            let (code, output) = self.exec(command, &run_id).await?;
+            if !transcript.is_empty() {
+                transcript.push('\n');
+            }
+            transcript.push_str(&format!("$ {command}\n"));
+            transcript.push_str(&output);
+            if code != 0 {
+                transcript.push_str(&format!("[exit {code}]\n"));
+                failed = true;
+            }
+            results.push(json!({ "command": command, "code": code }));
+
+            let status = if failed { "failed" } else { "in_progress" };
+            let snapshot = transcript.clone();
+            let label = status.to_string();
+            let item_id = id.clone();
+            self.patch_item(&item_id, move |item| {
+                item["status"] = json!(label);
+                item["output"] = json!(snapshot);
+            })
+            .await;
+
+            if failed {
+                break;
+            }
+        }
+
+        let status = if failed { "failed" } else { "passed" };
+        let label = status.to_string();
+        let item_id = id.clone();
+        self.patch_item(&item_id, move |item| {
+            item["status"] = json!(label);
+        })
+        .await;
+
+        {
+            let mut meta = self.meta.write().await;
+            meta.verify = Some(Verify {
+                status: status.to_string(),
+                at: now_ms(),
+                fingerprint: if failed { String::new() } else { fingerprint },
+                commands: results,
+            });
+            meta.updated_at = now_ms();
+            let snapshot = meta.clone();
+            drop(meta);
+            self.emit(json!({ "type": "task", "task": snapshot }));
+        }
+        self.persist().await;
+
+        if failed {
+            return Err(anyhow!("a check failed"));
+        }
+        Ok(())
+    }
+
+    /// Replay the task branch onto the current base branch.
+    pub async fn rebase(self: &Arc<Self>) -> Result<Value> {
+        if self.busy.load(Ordering::SeqCst) {
+            return Err(anyhow!("the agent is still working on this task"));
+        }
+        let (meta, _) = self.snapshot().await;
+        if meta.base_ref.is_empty() {
+            return Err(anyhow!("no base branch was recorded for this task"));
+        }
+        let wt = PathBuf::from(&meta.worktree);
+        let (ok, _, err) = git(&wt, &["rebase", &meta.base_ref]).await?;
+        if !ok {
+            let _ = git(&wt, &["rebase", "--abort"]).await;
+            return Err(anyhow!(
+                "rebase onto `{}` failed and was aborted:\n{err}",
+                meta.base_ref
+            ));
+        }
+        self.invalidate_verify().await;
+        Ok(json!({
+            "ok": true,
+            "message": format!("rebased onto `{}` — run verify again", meta.base_ref)
+        }))
+    }
+
+    /// Throw away every change in the worktree.
+    pub async fn reset(self: &Arc<Self>) -> Result<Value> {
+        if self.busy.load(Ordering::SeqCst) {
+            return Err(anyhow!("the agent is still working on this task"));
+        }
+        let (meta, _) = self.snapshot().await;
+        let wt = PathBuf::from(&meta.worktree);
+        let (ok, _, err) = git(&wt, &["reset", "--hard", &meta.base]).await?;
+        if !ok {
+            return Err(anyhow!("reset failed: {err}"));
+        }
+        let _ = git(&wt, &["clean", "-fd"]).await;
+        self.invalidate_verify().await;
+        Ok(json!({ "ok": true, "message": "worktree reset to the base commit" }))
+    }
+
+    async fn invalidate_verify(&self) {
+        let mut meta = self.meta.write().await;
+        meta.verify = None;
+        meta.updated_at = now_ms();
+        let snapshot = meta.clone();
+        drop(meta);
+        self.emit(json!({ "type": "task", "task": snapshot }));
+        self.persist().await;
+    }
+
+    /// Commit the worktree, refusing when checks are configured but have not
+    /// passed against exactly these contents.
+    async fn commit_worktree(&self) -> Result<TaskMeta> {
+        let (meta, _) = self.snapshot().await;
+        let has_checks = self
+            .ws
+            .upgrade()
+            .map(|ws| {
+                ws.settings
+                    .try_read()
+                    .map(|s| !s.checks.is_empty())
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
+        if has_checks {
+            let fingerprint = self.fingerprint().await;
+            match &meta.verify {
+                Some(v) if v.status == "passed" && v.fingerprint == fingerprint => {}
+                Some(v) if v.status == "passed" => {
+                    return Err(anyhow!(
+                        "the worktree changed since the last passing check — verify again"
+                    ));
+                }
+                _ => return Err(anyhow!("this task has not passed its checks — run verify")),
+            }
+        }
+
         let wt = PathBuf::from(&meta.worktree);
         let _ = git(&wt, &["add", "-A"]).await;
         let (ok, _, err) = git(&wt, &["commit", "-m", &format!("orch: {}", meta.title)]).await?;
-        let (_, status, _) = git(&wt, &["status", "--porcelain"]).await?;
-        if !ok && !status.is_empty() {
-            return Err(anyhow!("commit failed: {err}"));
+        if !ok {
+            let (_, status, _) = git(&wt, &["status", "--porcelain"]).await?;
+            if !status.is_empty() {
+                return Err(anyhow!("commit failed: {err}"));
+            }
         }
+        Ok(meta)
+    }
+
+    /// Commit, then fast-forward the repository onto the task branch when it
+    /// is safe to do so.
+    pub async fn merge(self: &Arc<Self>) -> Result<Value> {
+        let meta = self.commit_worktree().await?;
         let repo = self
             .ws
             .upgrade()
             .map(|ws| ws.repo.path.clone())
             .unwrap_or_else(|| meta.worktree.clone());
-        let message = format!(
-            "branch `{}` is ready. Merge it with:\n\n  git -C {} merge --no-ff {}",
-            meta.branch, repo, meta.branch
-        );
-        Ok(json!({ "ok": true, "message": message }))
+        let root = PathBuf::from(&repo);
+
+        let (_, dirty, _) = git(&root, &["status", "--porcelain"]).await?;
+        if !dirty.is_empty() {
+            return Ok(json!({
+                "ok": true,
+                "merged": false,
+                "message": format!(
+                    "branch `{}` is committed. The repository has uncommitted \
+                     changes, so merge it by hand:\n\n  git -C {} merge --no-ff {}",
+                    meta.branch, repo, meta.branch
+                )
+            }));
+        }
+
+        let message = format!("orch: {}", meta.title);
+        let (ok, _, err) = git(&root, &["merge", "--no-ff", "-m", &message, &meta.branch]).await?;
+        if !ok {
+            let _ = git(&root, &["merge", "--abort"]).await;
+            return Err(anyhow!("merge failed and was aborted:\n{err}"));
+        }
+        Ok(json!({
+            "ok": true,
+            "merged": true,
+            "message": format!("merged `{}` into `{}`", meta.branch, meta.base_ref)
+        }))
     }
 
     pub async fn remove(self: &Arc<Self>) -> Result<()> {
@@ -1127,4 +1550,31 @@ pub fn state_dir() -> PathBuf {
 
 pub fn project_dir(repo_path: &str) -> PathBuf {
     state_dir().join("projects").join(dir_key(repo_path))
+}
+
+async fn pump_pipe<R>(mut pipe: R, name: &'static str, tx: mpsc::Sender<(String, String)>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 4096];
+    let mut pending = String::new();
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                while let Some(idx) = pending.find('\n') {
+                    let line: String = pending.drain(..=idx).collect();
+                    if tx.send((name.to_string(), line)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if !pending.is_empty() {
+        let _ = tx.send((name.to_string(), pending)).await;
+    }
 }
