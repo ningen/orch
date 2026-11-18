@@ -12,10 +12,13 @@
 
   <aside class="rail">
     <div class="rail-head">
-      <div class="repo">
-        <span class="repo-name" id="repo-name">orch</span>
+      <button class="repo-switch" id="repo-switch" title="Switch repository (r)">
+        <span class="repo-line">
+          <span class="repo-name" id="repo-name">no repository</span>
+          <span class="repo-caret">›</span>
+        </span>
         <span class="repo-branch mono" id="repo-branch"></span>
-      </div>
+      </button>
       <button class="btn-new" id="new-task" title="New task (n)">
         <span class="plus">+</span> new task
       </button>
@@ -70,7 +73,7 @@
           describe the change, then review the diff and the command output before anything lands.
         </p>
         <button class="btn primary" id="empty-new">Create the first task</button>
-        <p class="empty-keys mono">n new task · j k switch · enter send</p>
+        <p class="empty-keys mono">n new task · r repositories · j k switch · enter send</p>
       </div>
     </div>
   </main>
@@ -119,6 +122,33 @@
       <button type="submit" class="btn primary">create task</button>
     </div>
   </form>
+</div>
+
+<div class="modal" id="repo-modal" hidden>
+  <div class="sheet repo-sheet">
+    <h2>Repositories</h2>
+
+    <div class="repo-list" id="repo-list"></div>
+
+    <div class="browse">
+      <div class="browse-head">
+        <button class="icon-btn" id="browse-up" type="button">up</button>
+        <span class="browse-path mono" id="browse-path"></span>
+      </div>
+      <div class="browse-list" id="browse-list"></div>
+    </div>
+
+    <form class="repo-open" id="repo-open-form">
+      <input id="repo-path" class="mono" placeholder="/path/to/repo" spellcheck="false" autocomplete="off">
+      <button class="btn primary" type="submit">open</button>
+    </form>
+
+    <div class="sheet-foot">
+      <span class="hint mono">esc to close</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="repo-cancel">close</button>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast" hidden></div>

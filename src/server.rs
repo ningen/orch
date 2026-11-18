@@ -1,10 +1,10 @@
 //! HTTP surface: JSON API, SSE event stream, and the embedded UI.
 
-use crate::task::{Hub, Task};
+use crate::task::Orch;
 use anyhow::anyhow;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -15,6 +15,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::convert::Infallible;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -25,7 +26,7 @@ const INDEX: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");
 const STYLE: &str = include_str!("../ui/style.css");
 
-pub fn router(hub: Arc<Hub>) -> Router {
+pub fn router(orch: Arc<Orch>) -> Router {
     Router::new()
         .route("/", get(index))
         .route(
@@ -33,12 +34,12 @@ pub fn router(hub: Arc<Hub>) -> Router {
             get(|| async { asset(APP_JS, "text/javascript") }),
         )
         .route("/style.css", get(|| async { asset(STYLE, "text/css") }))
-        .route(
-            "/favicon.ico",
-            get(|| async { axum::http::StatusCode::NO_CONTENT }),
-        )
+        .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/state", get(state))
         .route("/api/events", get(events))
+        .route("/api/repos", post(open_repo).delete(close_repo))
+        .route("/api/repos/current", post(set_current))
+        .route("/api/browse", get(browse))
         .route("/api/tasks", post(create))
         .route("/api/tasks/{id}", get(show).delete(remove))
         .route("/api/tasks/{id}/prompt", post(prompt))
@@ -47,7 +48,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/tasks/{id}/merge", post(merge))
         .route("/api/tasks/{id}/diff", get(diff))
         .route("/api/tasks/{id}/run", post(run))
-        .with_state(hub)
+        .with_state(orch)
 }
 
 struct ApiError(anyhow::Error);
@@ -75,16 +76,115 @@ async fn index() -> Response {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX).into_response()
 }
 
-async fn state(State(hub): State<Arc<Hub>>) -> Api<Value> {
-    let tasks = hub.list().await;
-    Ok(Json(json!({ "repo": hub.repo, "tasks": tasks })))
+async fn need_task(orch: &Arc<Orch>, id: &str) -> Result<Arc<crate::task::Task>, ApiError> {
+    orch.find_task(id)
+        .await
+        .ok_or_else(|| ApiError(anyhow!("no such task: {id}")))
 }
 
-async fn show(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> Api<Value> {
-    let task = hub
-        .get(&id)
-        .await
-        .ok_or_else(|| ApiError(anyhow!("no such task: {id}")))?;
+/* ------------------------------------------------------------------ state */
+
+async fn state(State(orch): State<Arc<Orch>>) -> Api<Value> {
+    Ok(Json(json!({
+        "current": orch.current_path().await,
+        "repos": orch.summary().await,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RepoBody {
+    path: String,
+}
+
+async fn open_repo(State(orch): State<Arc<Orch>>, Json(body): Json<RepoBody>) -> Api<Value> {
+    let ws = orch.open_workspace(FsPath::new(body.path.trim())).await?;
+    orch.set_current(&ws.repo.path).await;
+    Ok(Json(json!({
+        "repo": { "path": ws.repo.path, "name": ws.repo.name, "branch": ws.repo.branch },
+        "repos": orch.summary().await,
+        "current": orch.current_path().await,
+    })))
+}
+
+async fn set_current(State(orch): State<Arc<Orch>>, Json(body): Json<RepoBody>) -> Api<Value> {
+    let path = body.path.trim().to_string();
+    if orch.workspace(&path).await.is_none() {
+        return Err(ApiError(anyhow!("that repository is not open: {path}")));
+    }
+    orch.set_current(&path).await;
+    Ok(Json(json!({ "current": orch.current_path().await })))
+}
+
+async fn close_repo(State(orch): State<Arc<Orch>>, Json(body): Json<RepoBody>) -> Api<Value> {
+    orch.close_workspace(body.path.trim()).await;
+    Ok(Json(json!({
+        "repos": orch.summary().await,
+        "current": orch.current_path().await,
+    })))
+}
+
+#[derive(Deserialize)]
+struct BrowseQuery {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+async fn browse(Query(query): Query<BrowseQuery>) -> Api<Value> {
+    let start = query
+        .path
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(home_dir);
+    let path = std::fs::canonicalize(&start).unwrap_or(start);
+
+    let mut dirs: Vec<Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&path) {
+        for entry in entries.flatten().take(2000) {
+            let child = entry.path();
+            if !child.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            let is_repo = child.join(".git").exists();
+            dirs.push(json!({
+                "name": name,
+                "path": child.to_string_lossy(),
+                "repo": is_repo,
+            }));
+        }
+    }
+    dirs.sort_by(|a, b| {
+        let ra = a["repo"].as_bool().unwrap_or(false);
+        let rb = b["repo"].as_bool().unwrap_or(false);
+        rb.cmp(&ra).then_with(|| {
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
+        })
+    });
+
+    Ok(Json(json!({
+        "path": path.to_string_lossy(),
+        "parent": path.parent().map(|p| p.to_string_lossy().to_string()),
+        "dirs": dirs,
+    })))
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/* ------------------------------------------------------------------ tasks */
+
+async fn show(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
     let (meta, items) = task.snapshot().await;
     Ok(Json(json!({ "task": meta, "items": items })))
 }
@@ -98,12 +198,16 @@ struct CreateBody {
     model: Option<String>,
 }
 
-async fn create(State(hub): State<Arc<Hub>>, Json(body): Json<CreateBody>) -> Api<Value> {
+async fn create(State(orch): State<Arc<Orch>>, Json(body): Json<CreateBody>) -> Api<Value> {
     let title = body.title.trim().to_string();
     if title.is_empty() {
         return Err(ApiError(anyhow!("title is required")));
     }
-    let task = hub.create(title, body.model).await?;
+    let ws = orch
+        .current()
+        .await
+        .ok_or_else(|| ApiError(anyhow!("no repository is selected")))?;
+    let task = ws.create(title, body.model).await?;
     if let Some(prompt) = body
         .prompt
         .map(|p| p.trim().to_string())
@@ -120,18 +224,12 @@ struct PromptBody {
     text: String,
 }
 
-async fn need(hub: &Arc<Hub>, id: &str) -> Result<Arc<Task>, ApiError> {
-    hub.get(id)
-        .await
-        .ok_or_else(|| ApiError(anyhow!("no such task: {id}")))
-}
-
 async fn prompt(
-    State(hub): State<Arc<Hub>>,
+    State(orch): State<Arc<Orch>>,
     Path(id): Path<String>,
     Json(body): Json<PromptBody>,
 ) -> Api<Value> {
-    let task = need(&hub, &id).await?;
+    let task = need_task(&orch, &id).await?;
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return Err(ApiError(anyhow!("prompt is empty")));
@@ -140,8 +238,8 @@ async fn prompt(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn cancel(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> Api<Value> {
-    let task = need(&hub, &id).await?;
+async fn cancel(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
     task.cancel().await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -152,35 +250,37 @@ struct ModelBody {
 }
 
 async fn set_model(
-    State(hub): State<Arc<Hub>>,
+    State(orch): State<Arc<Orch>>,
     Path(id): Path<String>,
     Json(body): Json<ModelBody>,
 ) -> Api<Value> {
-    let task = need(&hub, &id).await?;
+    let task = need_task(&orch, &id).await?;
     task.set_model(body.value).await?;
     let (meta, _) = task.snapshot().await;
     Ok(Json(json!({ "task": meta })))
 }
 
-async fn merge(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> Api<Value> {
-    let task = need(&hub, &id).await?;
+async fn merge(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
     let result = task.commit().await?;
     Ok(Json(result))
 }
 
-async fn diff(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> Api<Value> {
-    let task = need(&hub, &id).await?;
+async fn diff(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
     let result = task.diff().await.unwrap_or_else(
         |e| json!({ "stat": "", "diff": format!("could not read the diff: {e:#}") }),
     );
     Ok(Json(result))
 }
 
-async fn remove(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> Api<Value> {
-    let task = need(&hub, &id).await?;
+async fn remove(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
     task.remove().await?;
     Ok(Json(json!({ "ok": true })))
 }
+
+/* -------------------------------------------------------------------- run */
 
 #[derive(Deserialize)]
 struct RunBody {
@@ -188,20 +288,19 @@ struct RunBody {
 }
 
 async fn run(
-    State(hub): State<Arc<Hub>>,
+    State(orch): State<Arc<Orch>>,
     Path(id): Path<String>,
     Json(body): Json<RunBody>,
 ) -> Api<Value> {
-    let task = need(&hub, &id).await?;
+    let task = need_task(&orch, &id).await?;
     let (meta, _) = task.snapshot().await;
     let command = body.command.trim().to_string();
     if command.is_empty() {
         return Err(ApiError(anyhow!("command is empty")));
     }
     let run_id = format!("r_{}", uuid::Uuid::new_v4().simple());
-    let hub = hub.clone();
-
     let task_run = run_id.clone();
+
     tokio::spawn(async move {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
@@ -214,11 +313,11 @@ async fn run(
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
-                hub.emit(json!({
+                task.emit(json!({
                     "type": "run", "taskId": meta.id, "runId": task_run,
                     "stream": "stderr", "text": format!("{e}\n")
                 }));
-                hub.emit(json!({
+                task.emit(json!({
                     "type": "run", "taskId": meta.id, "runId": task_run,
                     "stream": "exit", "text": "", "code": -1
                 }));
@@ -240,13 +339,13 @@ async fn run(
         }
         drop(tx);
 
-        let emitter = hub.clone();
+        let emitter = task.clone();
         let task_id = meta.id.clone();
-        let run = task_run.clone();
+        let run_id = task_run.clone();
         let drain = tokio::spawn(async move {
             while let Some((stream, text)) = rx.recv().await {
                 emitter.emit(json!({
-                    "type": "run", "taskId": task_id, "runId": run,
+                    "type": "run", "taskId": task_id, "runId": run_id,
                     "stream": stream, "text": text
                 }));
             }
@@ -254,7 +353,7 @@ async fn run(
 
         let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
         let _ = drain.await;
-        hub.emit(json!({
+        task.emit(json!({
             "type": "run", "taskId": meta.id, "runId": task_run,
             "stream": "exit", "text": "", "code": code
         }));
@@ -289,16 +388,16 @@ where
     }
 }
 
+/* ------------------------------------------------------------------ events */
+
 async fn events(
-    State(hub): State<Arc<Hub>>,
+    State(orch): State<Arc<Orch>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let mut rx = hub.subscribe();
+    let mut rx = orch.subscribe();
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
-                Ok(payload) => {
-                    yield Ok(Event::default().data(payload));
-                }
+                Ok(payload) => yield Ok(Event::default().data(payload)),
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             }

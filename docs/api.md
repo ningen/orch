@@ -52,7 +52,11 @@ type Item =
 
 | Method | Path | Body | Response |
 | --- | --- | --- | --- |
-| GET | `/api/state` | – | `{ repo: { path, name, branch }, tasks: Task[] }` |
+| GET | `/api/state` | – | `{ current, repos: RepoSummary[] }` |
+| POST | `/api/repos` | `{ path }` | open a repository and switch to it |
+| POST | `/api/repos/current` | `{ path }` | switch to an already-open repository |
+| DELETE | `/api/repos` | `{ path }` | close a repository |
+| GET | `/api/browse?path=` | – | `{ path, parent, dirs: [{ name, path, repo }] }` |
 | GET | `/api/tasks/{id}` | – | `{ task: Task, items: Item[] }` |
 | POST | `/api/tasks` | `{ title, prompt?, model? }` | `{ task, items }` |
 | POST | `/api/tasks/{id}/prompt` | `{ text }` | `{ ok: true }` |
@@ -64,15 +68,34 @@ type Item =
 | POST | `/api/tasks/{id}/run` | `{ command }` | `{ ok: true }` (output arrives on SSE) |
 | GET | `/api/events` | – | `text/event-stream` |
 
+`RepoSummary` is what `/api/state` returns per open repository:
+
+```ts
+type RepoSummary = {
+  path: string;      // absolute path, also the workspace key
+  name: string;      // last path component
+  branch: string;    // current HEAD branch
+  tasks: Task[];
+};
+```
+
+Several repositories can be open at once. Their agent sessions keep running
+while you switch, and every task route resolves the task across all of them, so
+`/api/tasks/{id}` works regardless of which repository is current.
+
 ## SSE stream
 
 `GET /api/events` emits `data: <json>\n\n` frames. Every frame has a `type`.
 
+Every frame carries `repo` (the absolute repository path) in addition to the
+fields below, so a client can route events without extra lookups.
+
 ```jsonc
-{ "type": "task", "task": Task }                                  // upsert task
-{ "type": "item", "taskId": "...", "item": Item }                 // upsert item (create or replace)
-{ "type": "delta", "taskId": "...", "itemId": "...", "text": "…" } // append text to an item
-{ "type": "run", "taskId": "...", "runId": "...", "stream": "stdout" | "stderr" | "exit", "text": "…", "code": 0 }
+{ "type": "task", "repo": "…", "task": Task }                     // upsert task
+{ "type": "removed", "repo": "…", "taskId": "…" }                 // task deleted
+{ "type": "item", "repo": "…", "taskId": "...", "item": Item }    // upsert item (create or replace)
+{ "type": "delta", "repo": "…", "taskId": "...", "itemId": "...", "text": "…" } // append to an item
+{ "type": "run", "repo": "…", "taskId": "...", "runId": "...", "stream": "stdout" | "stderr" | "exit", "text": "…", "code": 0 }
 { "type": "log", "text": "…" }                                    // daemon-level notice
 ```
 

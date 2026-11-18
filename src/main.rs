@@ -1,7 +1,8 @@
 //! orch — a local workbench for orchestrating coding agents.
 //!
 //! One task is one git worktree plus one live ACP agent. The daemon serves a
-//! single-page UI and a JSON API on localhost.
+//! single-page UI and a JSON API on localhost, and can hold several
+//! repositories open at once.
 
 mod acp;
 mod server;
@@ -10,7 +11,7 @@ mod task;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
-use task::{Config, Hub};
+use task::{Config, Orch};
 use tokio::net::TcpListener;
 
 const DEFAULT_PORT: u16 = 7717;
@@ -24,14 +25,17 @@ usage:
   orch [--repo PATH] [--port N] [--agent CMD] [--no-browser]
 
 options:
-  --repo PATH    git repository to work in (default: current directory)
+  --repo PATH    repository to open first (default: current directory)
   --port N       port to listen on (default: {port})
   --agent CMD    ACP agent command (default: {agent})
   --no-browser   do not open the UI in a browser
   -h, --help     show this help
 
+More repositories can be opened from the UI.
+
 environment:
-  ORCH_HOME      where worktrees and task state live (default: ~/.orch)
+  ORCH_HOME      where worktrees, state, and the repository list live
+                 (default: ~/.orch)
   ORCH_DEBUG     set to 1 to print agent stderr",
         version = env!("CARGO_PKG_VERSION"),
         port = DEFAULT_PORT,
@@ -65,37 +69,46 @@ async fn main() -> Result<()> {
         }
     }
 
-    let repo = std::fs::canonicalize(&repo)
-        .with_context(|| format!("cannot open repository {}", repo.display()))?;
-    let project = task::project_dir(&repo.to_string_lossy());
-    std::fs::create_dir_all(project.join("tasks"))?;
-    std::fs::create_dir_all(project.join("worktrees"))?;
-
     let mut parts = agent.split_whitespace();
     let program = parts.next().context("--agent is empty")?.to_string();
     let agent_args: Vec<String> = parts.map(str::to_string).collect();
 
-    let hub = Hub::open(
-        &repo,
-        project,
+    let root = task::state_dir();
+    std::fs::create_dir_all(&root)?;
+    let orch = Orch::new(
         Config {
             program,
             args: agent_args,
         },
-    )
-    .await?;
+        root,
+    );
 
-    let app = server::router(Arc::clone(&hub));
+    // `--repo` may be absent from a cold start; restore whatever it finds.
+    let first = std::fs::canonicalize(&repo).ok();
+    if first.is_none() {
+        eprintln!(
+            "note: {} is not a directory, restoring the previous list",
+            repo.display()
+        );
+    }
+    orch.restore(first.as_deref()).await?;
+
+    let app = server::router(Arc::clone(&orch));
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .with_context(|| format!("cannot bind 127.0.0.1:{port}"))?;
     let url = format!("http://127.0.0.1:{port}");
 
     println!("orch {}", env!("CARGO_PKG_VERSION"));
-    println!("  repo   {}", hub.repo.path);
-    println!("  branch {}", hub.repo.branch);
+    match orch.current().await {
+        Some(ws) => {
+            println!("  repo   {}", ws.repo.path);
+            println!("  branch {}", ws.repo.branch);
+            println!("  tasks  {}", ws.task_count().await);
+        }
+        None => println!("  repo   (none open)"),
+    }
     println!("  url    {url}");
-    println!("  tasks  {}", hub.list().await.len());
 
     if browser {
         open_browser(&url);

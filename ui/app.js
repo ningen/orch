@@ -10,15 +10,16 @@ const el = (tag, cls) => {
 };
 
 const state = {
-  repo: null,
-  tasks: new Map(),
-  current: null,
+  repos: new Map(), // path -> { path, name, branch, tasks: Map<id, task> }
+  currentRepo: null,
+  current: null, // task id
   items: [],
   nodes: new Map(),
   pinned: true,
   models: [],
   connected: false,
   everConnected: false,
+  browse: null,
 };
 
 /* ------------------------------------------------------------------ api */
@@ -55,6 +56,15 @@ function shortTokens(n) {
   return `${(n / 1000).toFixed(1)}k`;
 }
 
+function activeRepo() {
+  return state.currentRepo ? state.repos.get(state.currentRepo) : null;
+}
+
+function repoTasks() {
+  const repo = activeRepo();
+  return repo ? [...repo.tasks.values()].sort((a, b) => a.createdAt - b.createdAt) : [];
+}
+
 let toastTimer = null;
 function toast(message, isError = false) {
   const node = $("toast");
@@ -62,17 +72,27 @@ function toast(message, isError = false) {
   node.classList.toggle("error", isError);
   node.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => {
-    node.hidden = true;
-  }, isError ? 9000 : 6000);
+  toastTimer = setTimeout(
+    () => {
+      node.hidden = true;
+    },
+    isError ? 9000 : 6000,
+  );
 }
 
 /* ------------------------------------------------------------------ rail */
 
+function renderRepoLabel() {
+  const repo = activeRepo();
+  $("repo-name").textContent = repo ? repo.name : "open a repository";
+  $("repo-name").title = repo ? repo.path : "click to open a git repository";
+  $("repo-branch").textContent = repo ? repo.branch : "";
+}
+
 function renderRail() {
   const list = $("task-list");
   list.textContent = "";
-  const tasks = [...state.tasks.values()].sort((a, b) => a.createdAt - b.createdAt);
+  const tasks = repoTasks();
 
   for (const task of tasks) {
     const row = el("button", "task-row");
@@ -99,6 +119,7 @@ function renderRail() {
   }
 
   $("task-count").textContent = tasks.length ? `${tasks.length}` : "";
+  $("task-count").title = state.repos.size > 1 ? `${state.repos.size} repositories open` : "";
 }
 
 let railPending = false;
@@ -109,13 +130,6 @@ function scheduleRail() {
     railPending = false;
     renderRail();
   });
-}
-
-function touchTask(task) {
-  state.tasks.set(task.id, task);
-  if (task.models && task.models.length) state.models = task.models;
-  scheduleRail();
-  if (task.id === state.current) renderHeader();
 }
 
 /* ---------------------------------------------------------------- header */
@@ -136,16 +150,26 @@ function statusLabel(status) {
 }
 
 function renderHeader() {
-  const task = state.tasks.get(state.current);
+  const repo = activeRepo();
+  const task = repo && state.current ? repo.tasks.get(state.current) : null;
   const topbar = $("topbar");
   const empty = $("empty");
+
   if (!task) {
     topbar.hidden = true;
     empty.hidden = false;
     $("input").disabled = true;
     $("send").disabled = true;
+    $("empty-new").textContent = repo ? "Create the first task" : "Open a repository";
+    $("empty-lead").textContent = repo
+      ? "A task is an isolated git worktree and one live agent."
+      : "Pick the git repository you want to work in.";
+    $("empty-body").textContent = repo
+      ? "Nothing touches your working tree until you commit and merge. Create a task, describe the change, then review the diff and the command output before anything lands."
+      : "orch keeps one worktree per task, so several agents can work in parallel without ever sharing a working tree. Switch repositories at any time — their tasks keep running.";
     return;
   }
+
   empty.hidden = true;
   topbar.hidden = false;
 
@@ -230,7 +254,8 @@ function renderProse(box, text, streaming) {
 }
 
 function shortPath(path) {
-  const task = state.tasks.get(state.current);
+  const repo = activeRepo();
+  const task = repo && state.current ? repo.tasks.get(state.current) : null;
   if (task && task.worktree && path.startsWith(task.worktree)) {
     return path.slice(task.worktree.length).replace(/^\//, "") || ".";
   }
@@ -248,9 +273,13 @@ function renderToolBody(box, item) {
       line.appendChild(label);
       const rendered =
         typeof value === "string"
-          ? (/^\//.test(value) ? shortPath(value) : value)
+          ? /^\//.test(value)
+            ? shortPath(value)
+            : value
           : JSON.stringify(value, null, 2);
-      line.appendChild(document.createTextNode(rendered.length > 4000 ? `${rendered.slice(0, 4000)}\n…` : rendered));
+      line.appendChild(
+        document.createTextNode(rendered.length > 4000 ? `${rendered.slice(0, 4000)}\n…` : rendered),
+      );
       box.appendChild(line);
     }
   }
@@ -276,7 +305,18 @@ function paint(item) {
   }
   if (item.kind === "thought") {
     node.className = "item thought";
-    node.textContent = item.text;
+    const body = el("div", "thought-body");
+    body.textContent = item.text;
+    if (item.text.length > 320) body.classList.add("clamped");
+    node.textContent = "";
+    node.appendChild(body);
+    if (!node.dataset.wired) {
+      node.dataset.wired = "1";
+      node.addEventListener("click", () => {
+        const target = node.querySelector(".thought-body");
+        if (target) target.classList.toggle("clamped");
+      });
+    }
     return;
   }
   if (item.kind === "agent") {
@@ -287,11 +327,10 @@ function paint(item) {
   if (item.kind === "tool") {
     node.className = "item";
     if (node.firstChild) {
-      // already built: only refresh the parts that change
-      const state = node.querySelector(".tool-state");
-      if (state) {
-        state.textContent = item.status;
-        state.className = `tool-state ${item.status}`;
+      const badge = node.querySelector(".tool-state");
+      if (badge) {
+        badge.textContent = item.status;
+        badge.className = `tool-state ${item.status}`;
       }
       const paths = node.querySelector(".tool-paths");
       if (paths) paths.textContent = (item.locations || []).map(shortPath).join("  ");
@@ -309,12 +348,12 @@ function paint(item) {
     title.textContent = item.title || "tool";
     const kind = el("span", "tool-kind");
     kind.textContent = item.toolKind || "";
-    const status = el("span", `tool-state ${item.status}`);
-    status.textContent = item.status;
+    const badge = el("span", `tool-state ${item.status}`);
+    badge.textContent = item.status;
     const paths = el("span", "tool-paths");
     paths.textContent = (item.locations || []).map(shortPath).join("  ");
     paths.title = (item.locations || []).join("\n");
-    head.append(caret, title, kind, status, paths);
+    head.append(caret, title, kind, badge, paths);
 
     const body = el("div", "tool-body");
     renderToolBody(body, item);
@@ -376,33 +415,46 @@ function upsertItem(item) {
   scrollToEnd();
 }
 
+function clearStream() {
+  state.items = [];
+  state.nodes.clear();
+  $("stream").textContent = "";
+  $("diff").textContent = "";
+  $("diff-meta").textContent = "";
+  $("run-out").textContent = "";
+}
+
 /* ---------------------------------------------------------------- events */
 
 function handle(event) {
   switch (event.type) {
     case "task": {
-      if (!event.task) {
-        if (event.removed) {
-          state.tasks.delete(event.removed);
-          if (state.current === event.removed) {
-            state.current = null;
-            renderStream();
-            renderHeader();
-          }
-          renderRail();
-        }
-        return;
+      const repo = state.repos.get(event.repo);
+      if (!repo || !event.task) return;
+      repo.tasks.set(event.task.id, event.task);
+      scheduleRail();
+      if (event.repo === state.currentRepo && event.task.id === state.current) renderHeader();
+      return;
+    }
+    case "removed": {
+      const repo = state.repos.get(event.repo);
+      if (!repo) return;
+      repo.tasks.delete(event.taskId);
+      if (event.repo === state.currentRepo && event.taskId === state.current) {
+        state.current = null;
+        clearStream();
+        renderHeader();
       }
-      touchTask(event.task);
+      scheduleRail();
       return;
     }
     case "item": {
-      if (event.taskId !== state.current) return;
+      if (event.repo !== state.currentRepo || event.taskId !== state.current) return;
       upsertItem(event.item);
       return;
     }
     case "delta": {
-      if (event.taskId !== state.current) return;
+      if (event.repo !== state.currentRepo || event.taskId !== state.current) return;
       const item = state.items.find((x) => x.id === event.itemId);
       if (!item) return;
       item.text = (item.text || "") + event.text;
@@ -410,7 +462,7 @@ function handle(event) {
       return;
     }
     case "run": {
-      if (event.taskId !== state.current) return;
+      if (event.repo !== state.currentRepo || event.taskId !== state.current) return;
       appendRun(event);
       return;
     }
@@ -424,26 +476,140 @@ function handle(event) {
 
 /* -------------------------------------------------------------- selection */
 
+async function loadTask(id) {
+  const data = await api(`/api/tasks/${id}`);
+  if (state.current !== id) return;
+  const repo = state.repos.get(state.currentRepo);
+  if (repo) repo.tasks.set(id, data.task);
+  state.items = data.items || [];
+  renderStream();
+  renderHeader();
+  loadDiff();
+}
+
 async function selectTask(id) {
-  if (!state.tasks.has(id)) return;
+  const repo = activeRepo();
+  if (!repo || !repo.tasks.has(id)) return;
   state.current = id;
-  state.items = [];
-  state.nodes.clear();
-  $("stream").textContent = "";
+  clearStream();
   renderRail();
   renderHeader();
-  $("diff").textContent = "";
-  $("diff-meta").textContent = "";
-  $("run-out").textContent = "";
-
   try {
-    const data = await api(`/api/tasks/${id}`);
-    if (state.current !== id) return;
-    state.tasks.set(id, data.task);
-    state.items = data.items || [];
-    renderStream();
-    renderHeader();
-    loadDiff();
+    await loadTask(id);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+/* ------------------------------------------------------------ repositories */
+
+function renderRepoList() {
+  const list = $("repo-list");
+  list.textContent = "";
+  const repos = [...state.repos.values()].sort((a, b) => a.name.localeCompare(b.name));
+  if (!repos.length) {
+    const empty = el("div", "repo-empty");
+    empty.textContent = "no repositories open yet";
+    list.appendChild(empty);
+    return;
+  }
+  for (const repo of repos) {
+    const row = el("button", "repo-item");
+    row.type = "button";
+    if (repo.path === state.currentRepo) row.classList.add("active");
+
+    const name = el("span", "repo-item-name");
+    name.textContent = repo.name;
+    const branch = el("span", "repo-item-branch mono");
+    branch.textContent = repo.branch;
+    const count = el("span", "repo-item-count mono");
+    count.textContent = `${repo.tasks.size}`;
+    const path = el("span", "repo-item-path mono");
+    path.textContent = repo.path;
+
+    const head = el("span", "repo-item-head");
+    head.append(name, branch, count);
+
+    row.append(head, path);
+    row.title = `${repo.path}\n${repo.tasks.size} tasks`;
+    row.addEventListener("click", () => switchRepo(repo.path));
+    list.appendChild(row);
+  }
+}
+
+function renderBrowse() {
+  const browse = state.browse;
+  if (!browse) return;
+  $("browse-path").textContent = browse.path;
+  $("browse-path").title = browse.path;
+  $("browse-up").disabled = !browse.parent;
+
+  const list = $("browse-list");
+  list.textContent = "";
+  for (const entry of browse.dirs) {
+    const row = el("button", entry.repo ? "browse-row repo" : "browse-row");
+    row.type = "button";
+    const name = el("span", "browse-name");
+    name.textContent = entry.name;
+    const tag = el("span", "browse-tag mono");
+    tag.textContent = entry.repo ? "git" : "";
+    row.append(name, tag);
+    row.addEventListener("click", () => {
+      if (entry.repo) openRepo(entry.path);
+      else browseTo(entry.path);
+    });
+    list.appendChild(row);
+  }
+  if (!browse.dirs.length) {
+    const empty = el("div", "browse-empty");
+    empty.textContent = "no subdirectories";
+    list.appendChild(empty);
+  }
+}
+
+async function browseTo(path) {
+  try {
+    state.browse = await api(`/api/browse?path=${encodeURIComponent(path)}`);
+    renderBrowse();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function openRepoModal() {
+  $("repo-modal").hidden = false;
+  renderRepoList();
+  const start = state.currentRepo || (state.browse && state.browse.path) || "/";
+  const parent = start.replace(/\/[^/]+$/, "") || "/";
+  browseTo(parent);
+  setTimeout(() => $("repo-path").focus(), 30);
+}
+
+function closeRepoModal() {
+  $("repo-modal").hidden = true;
+}
+
+async function switchRepo(path) {
+  if (path === state.currentRepo) {
+    closeRepoModal();
+    return;
+  }
+  try {
+    await api("/api/repos/current", { method: "POST", body: JSON.stringify({ path }) });
+    closeRepoModal();
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function openRepo(path) {
+  const target = (path || "").trim();
+  if (!target) return;
+  try {
+    await api("/api/repos", { method: "POST", body: JSON.stringify({ path: target }) });
+    closeRepoModal();
+    await refresh();
   } catch (error) {
     toast(error.message, true);
   }
@@ -462,11 +628,17 @@ function renderDiff(text) {
   }
   for (const line of text.split("\n")) {
     const span = el("span", "ln");
-    if (line.startsWith("diff --git") || line.startsWith("--- ") || line.startsWith("+++ ")) span.classList.add("file");
+    if (line.startsWith("diff --git") || line.startsWith("--- ") || line.startsWith("+++ "))
+      span.classList.add("file");
     else if (line.startsWith("@@")) span.classList.add("hunk");
     else if (line.startsWith("+")) span.classList.add("add");
     else if (line.startsWith("-")) span.classList.add("del");
-    else if (line.startsWith("index ") || line.startsWith("new file") || line.startsWith("deleted file")) span.classList.add("meta");
+    else if (
+      line.startsWith("index ") ||
+      line.startsWith("new file") ||
+      line.startsWith("deleted file")
+    )
+      span.classList.add("meta");
     span.textContent = line || " ";
     out.appendChild(span);
   }
@@ -514,7 +686,8 @@ async function send() {
   const text = input.value.trim();
   if (!text || !state.current) return;
   const id = state.current;
-  const task = state.tasks.get(id);
+  const repo = activeRepo();
+  const task = repo && repo.tasks.get(id);
   if (task && (task.status === "running" || task.status === "waiting")) {
     toast("the agent is still working — stop it first", true);
     return;
@@ -522,10 +695,7 @@ async function send() {
   input.value = "";
   autoSize();
   try {
-    await api(`/api/tasks/${id}/prompt`, {
-      method: "POST",
-      body: JSON.stringify({ text }),
-    });
+    await api(`/api/tasks/${id}/prompt`, { method: "POST", body: JSON.stringify({ text }) });
   } catch (error) {
     input.value = text;
     autoSize();
@@ -534,6 +704,10 @@ async function send() {
 }
 
 function openModal() {
+  if (!state.currentRepo) {
+    openRepoModal();
+    return;
+  }
   $("modal").hidden = false;
   $("new-title").value = "";
   $("new-prompt").value = "";
@@ -568,7 +742,8 @@ async function createTask(event) {
   try {
     const data = await api("/api/tasks", { method: "POST", body: JSON.stringify(body) });
     closeModal();
-    state.tasks.set(data.task.id, data.task);
+    const repo = activeRepo();
+    if (repo) repo.tasks.set(data.task.id, data.task);
     await selectTask(data.task.id);
     renderRail();
   } catch (error) {
@@ -606,27 +781,47 @@ function connect() {
 async function refresh() {
   try {
     const data = await api("/api/state");
-    state.repo = data.repo;
-    state.tasks = new Map((data.tasks || []).map((task) => [task.id, task]));
-    for (const task of state.tasks.values()) {
-      if (task.models && task.models.length) {
-        state.models = task.models;
-        break;
+    const repos = new Map();
+    for (const repo of data.repos || []) {
+      repos.set(repo.path, {
+        path: repo.path,
+        name: repo.name,
+        branch: repo.branch,
+        tasks: new Map((repo.tasks || []).map((task) => [task.id, task])),
+      });
+      if (!state.models.length) {
+        for (const task of repo.tasks || []) {
+          if (task.models && task.models.length) {
+            state.models = task.models;
+            break;
+          }
+        }
       }
     }
-    $("repo-name").textContent = data.repo.name;
-    $("repo-branch").textContent = data.repo.branch;
+    state.repos = repos;
+    state.currentRepo =
+      data.current && repos.has(data.current) ? data.current : (repos.keys().next().value || null);
+
+    renderRepoLabel();
     renderRail();
-    if (state.current && state.tasks.has(state.current)) {
-      const fresh = await api(`/api/tasks/${state.current}`);
-      state.items = fresh.items || [];
-      state.tasks.set(state.current, fresh.task);
-      renderStream();
+
+    const repo = activeRepo();
+    if (!repo) {
+      state.current = null;
+      clearStream();
       renderHeader();
-    } else if (!state.current) {
-      const tasks = [...state.tasks.values()].sort((a, b) => a.createdAt - b.createdAt);
-      if (tasks.length) await selectTask(tasks[tasks.length - 1].id);
-      else renderHeader();
+      return;
+    }
+    if (state.current && repo.tasks.has(state.current)) {
+      await loadTask(state.current);
+      return;
+    }
+    const tasks = repoTasks();
+    if (tasks.length) await selectTask(tasks[tasks.length - 1].id);
+    else {
+      state.current = null;
+      clearStream();
+      renderHeader();
     }
   } catch (error) {
     toast(error.message, true);
@@ -636,8 +831,24 @@ async function refresh() {
 /* ------------------------------------------------------------------- init */
 
 function wire() {
+  $("repo-switch").addEventListener("click", openRepoModal);
+  $("repo-cancel").addEventListener("click", closeRepoModal);
+  $("repo-modal").addEventListener("click", (event) => {
+    if (event.target === $("repo-modal")) closeRepoModal();
+  });
+  $("browse-up").addEventListener("click", () => {
+    if (state.browse && state.browse.parent) browseTo(state.browse.parent);
+  });
+  $("repo-open-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    openRepo($("repo-path").value);
+  });
+
   $("new-task").addEventListener("click", openModal);
-  $("empty-new").addEventListener("click", openModal);
+  $("empty-new").addEventListener("click", () => {
+    if (state.currentRepo) openModal();
+    else openRepoModal();
+  });
   $("new-cancel").addEventListener("click", closeModal);
   $("new-form").addEventListener("submit", createTask);
   $("modal").addEventListener("click", (event) => {
@@ -665,7 +876,8 @@ function wire() {
         method: "POST",
         body: JSON.stringify({ value: event.target.value }),
       });
-      state.tasks.set(id, data.task);
+      const repo = activeRepo();
+      if (repo) repo.tasks.set(id, data.task);
       renderHeader();
       renderRail();
     } catch (error) {
@@ -730,8 +942,9 @@ function wire() {
   $("jump").addEventListener("click", () => scrollToEnd(true));
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !$("modal").hidden) {
-      closeModal();
+    if (event.key === "Escape") {
+      if (!$("repo-modal").hidden) closeRepoModal();
+      else if (!$("modal").hidden) closeModal();
       return;
     }
     const typing =
@@ -745,10 +958,13 @@ function wire() {
       openModal();
       return;
     }
+    if (event.key === "r") {
+      event.preventDefault();
+      openRepoModal();
+      return;
+    }
     if (event.key === "j" || event.key === "k") {
-      const ids = [...state.tasks.values()]
-        .sort((a, b) => a.createdAt - b.createdAt)
-        .map((task) => task.id);
+      const ids = repoTasks().map((task) => task.id);
       if (!ids.length) return;
       const index = ids.indexOf(state.current);
       const next = event.key === "j" ? index + 1 : index - 1;
@@ -766,7 +982,7 @@ async function boot() {
   await refresh();
   autoSize();
   setInterval(() => {
-    if (state.tasks.size) renderRail();
+    if (state.repos.size) renderRail();
   }, 60000);
 }
 

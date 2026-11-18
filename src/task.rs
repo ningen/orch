@@ -1,4 +1,8 @@
-//! Tasks: one git worktree plus one live ACP agent session.
+//! Workspaces, tasks, and agent sessions.
+//!
+//! A workspace is one git repository. A task is one isolated git worktree plus
+//! one live ACP agent session inside that workspace. Several workspaces can be
+//! open at once, and their tasks keep running while you switch between them.
 
 use crate::acp::{self, Acp, Incoming};
 use anyhow::{Context, Result, anyhow};
@@ -17,7 +21,7 @@ pub struct Config {
     pub args: Vec<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoInfo {
     pub path: String,
@@ -47,12 +51,29 @@ struct Stored {
     items: Vec<Value>,
 }
 
-pub struct Hub {
+#[derive(Serialize, Deserialize, Default)]
+struct Registry {
+    #[serde(default)]
+    repos: Vec<String>,
+    #[serde(default)]
+    current: Option<String>,
+}
+
+/// The daemon: every open repository plus one event stream for the UI.
+pub struct Orch {
+    pub cfg: Config,
+    pub root: PathBuf,
+    pub workspaces: RwLock<BTreeMap<String, Arc<Workspace>>>,
+    current: RwLock<Option<String>>,
+    tx: broadcast::Sender<String>,
+}
+
+/// One open git repository.
+pub struct Workspace {
     pub repo: RepoInfo,
     pub dir: PathBuf,
-    pub cfg: Config,
-    tx: broadcast::Sender<String>,
     pub tasks: RwLock<BTreeMap<String, Arc<Task>>>,
+    orch: Weak<Orch>,
     models: RwLock<Vec<Value>>,
     default_model: RwLock<Option<String>>,
 }
@@ -60,7 +81,7 @@ pub struct Hub {
 pub struct Task {
     pub meta: RwLock<TaskMeta>,
     pub items: RwLock<Vec<Value>>,
-    hub: Weak<Hub>,
+    ws: Weak<Workspace>,
     agent: Mutex<Option<Arc<Acp>>>,
     session: RwLock<Option<String>>,
     spawn_lock: Mutex<()>,
@@ -120,49 +141,194 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<(bool, String, String)> {
     ))
 }
 
-impl Hub {
-    pub async fn open(repo_path: &Path, dir: PathBuf, cfg: Config) -> Result<Arc<Hub>> {
-        let path = std::fs::canonicalize(repo_path)?;
-        let name = path
+/* ------------------------------------------------------------------ orch */
+
+impl Orch {
+    pub fn new(cfg: Config, root: PathBuf) -> Arc<Orch> {
+        let (tx, _) = broadcast::channel(2048);
+        Arc::new(Orch {
+            cfg,
+            root,
+            workspaces: RwLock::new(BTreeMap::new()),
+            current: RwLock::new(None),
+            tx,
+        })
+    }
+
+    pub fn emit(&self, value: Value) {
+        let _ = self.tx.send(value.to_string());
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.tx.subscribe()
+    }
+
+    fn registry_path(&self) -> PathBuf {
+        self.root.join("workspaces.json")
+    }
+
+    /// Reopen every repository the daemon saw last time.
+    pub async fn restore(self: &Arc<Self>, first: Option<&Path>) -> Result<()> {
+        let registry: Registry = std::fs::read_to_string(self.registry_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+
+        let mut order: Vec<String> = Vec::new();
+        if let Some(path) = first {
+            let canonical = std::fs::canonicalize(path)?;
+            order.push(canonical.to_string_lossy().to_string());
+        }
+        for path in registry.repos {
+            if !order.contains(&path) {
+                order.push(path);
+            }
+        }
+
+        for path in order {
+            if let Err(error) = self.open_workspace(Path::new(&path)).await {
+                eprintln!("skipping {path}: {error:#}");
+            }
+        }
+
+        if let Some(current) = registry.current {
+            self.set_current(&current).await;
+        }
+        if let Some(path) = first {
+            let canonical = std::fs::canonicalize(path)?;
+            self.set_current(&canonical.to_string_lossy()).await;
+        }
+        Ok(())
+    }
+
+    /// Open a repository (or return the one already open).
+    pub async fn open_workspace(self: &Arc<Self>, path: &Path) -> Result<Arc<Workspace>> {
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        let (ok, top, err) = git(&canonical, &["rev-parse", "--show-toplevel"]).await?;
+        if !ok || top.is_empty() {
+            return Err(anyhow!(
+                "{} is not a git repository ({err})",
+                path.display()
+            ));
+        }
+        let key = top.clone();
+        if let Some(ws) = self.workspaces.read().await.get(&key) {
+            return Ok(ws.clone());
+        }
+
+        let ws = Workspace::load(self, PathBuf::from(&top)).await?;
+        self.workspaces.write().await.insert(key, ws.clone());
+        self.save_registry().await;
+        Ok(ws)
+    }
+
+    pub async fn workspace(&self, path: &str) -> Option<Arc<Workspace>> {
+        self.workspaces.read().await.get(path).cloned()
+    }
+
+    pub async fn current(&self) -> Option<Arc<Workspace>> {
+        let key = self.current.read().await.clone()?;
+        self.workspace(&key).await
+    }
+
+    pub async fn current_path(&self) -> Option<String> {
+        self.current.read().await.clone()
+    }
+
+    pub async fn set_current(&self, path: &str) {
+        if self.workspaces.read().await.contains_key(path) {
+            *self.current.write().await = Some(path.to_string());
+            self.save_registry().await;
+        }
+    }
+
+    /// Every workspace in a shape the UI can render directly.
+    pub async fn summary(&self) -> Vec<Value> {
+        let workspaces = self.workspaces.read().await;
+        let mut out = Vec::with_capacity(workspaces.len());
+        for ws in workspaces.values() {
+            let mut tasks: Vec<TaskMeta> = Vec::new();
+            for task in ws.tasks.read().await.values() {
+                tasks.push(task.meta.read().await.clone());
+            }
+            tasks.sort_by_key(|m| m.created_at);
+            out.push(json!({
+                "path": ws.repo.path,
+                "name": ws.repo.name,
+                "branch": ws.repo.branch,
+                "tasks": tasks,
+            }));
+        }
+        out
+    }
+
+    pub async fn find_task(&self, id: &str) -> Option<Arc<Task>> {
+        for ws in self.workspaces.read().await.values() {
+            if let Some(task) = ws.tasks.read().await.get(id) {
+                return Some(task.clone());
+            }
+        }
+        None
+    }
+
+    async fn save_registry(&self) {
+        let repos: Vec<String> = self.workspaces.read().await.keys().cloned().collect();
+        let current = self.current.read().await.clone();
+        let registry = Registry { repos, current };
+        if let Ok(text) = serde_json::to_string_pretty(&registry) {
+            let _ = std::fs::create_dir_all(&self.root);
+            let path = self.registry_path();
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    pub async fn close_workspace(&self, path: &str) {
+        self.workspaces.write().await.remove(path);
+        self.save_registry().await;
+    }
+}
+
+/* ------------------------------------------------------------- workspace */
+
+impl Workspace {
+    async fn load(orch: &Arc<Orch>, root: PathBuf) -> Result<Arc<Workspace>> {
+        let path = root.to_string_lossy().to_string();
+        let name = root
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("repo")
             .to_string();
-        let branch = std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(&path)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "HEAD".into());
+        let (_, branch, _) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
 
-        let (tx, _) = broadcast::channel(1024);
-        let hub = Arc::new(Hub {
+        let dir = project_dir(&path);
+        let tasks_dir = dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir)?;
+        std::fs::create_dir_all(dir.join("worktrees"))?;
+
+        let ws = Arc::new(Workspace {
             repo: RepoInfo {
-                path: path.to_string_lossy().to_string(),
+                path: path.clone(),
                 name,
                 branch,
             },
             dir,
-            cfg,
-            tx,
             tasks: RwLock::new(BTreeMap::new()),
+            orch: Arc::downgrade(orch),
             models: RwLock::new(Vec::new()),
             default_model: RwLock::new(None),
         });
-        hub.reload().await?;
-        Ok(hub)
-    }
 
-    async fn reload(self: &Arc<Self>) -> Result<()> {
-        let tasks_dir = self.dir.join("tasks");
-        std::fs::create_dir_all(&tasks_dir)?;
         let mut map = BTreeMap::new();
         for entry in std::fs::read_dir(&tasks_dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            let file = entry?.path();
+            if file.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
             let Ok(mut stored) = serde_json::from_str::<Stored>(&text) else {
@@ -178,7 +344,7 @@ impl Hub {
             let task = Arc::new(Task {
                 meta: RwLock::new(stored.task.clone()),
                 items: RwLock::new(stored.items),
-                hub: Arc::downgrade(self),
+                ws: Arc::downgrade(&ws),
                 agent: Mutex::new(None),
                 session: RwLock::new(None),
                 spawn_lock: Mutex::new(()),
@@ -187,12 +353,10 @@ impl Hub {
             });
             map.insert(stored.task.id.clone(), task);
         }
-        *self.tasks.write().await = map;
 
-        // Seed the model catalogue from whatever the last session saw.
         let mut models = Vec::new();
         let mut default = None;
-        for task in self.tasks.read().await.values() {
+        for task in map.values() {
             let meta = task.meta.read().await;
             if models.is_empty() && !meta.models.is_empty() {
                 models = meta.models.clone();
@@ -201,31 +365,21 @@ impl Hub {
                 default = meta.model.clone();
             }
         }
-        *self.models.write().await = models;
-        *self.default_model.write().await = default;
-        Ok(())
+        *ws.tasks.write().await = map;
+        *ws.models.write().await = models;
+        *ws.default_model.write().await = default;
+        Ok(ws)
     }
 
+    /// Every event leaving a workspace carries the repository it belongs to.
     pub fn emit(&self, value: Value) {
-        let _ = self.tx.send(value.to_string());
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<String> {
-        self.tx.subscribe()
-    }
-
-    pub async fn list(&self) -> Vec<TaskMeta> {
-        let tasks = self.tasks.read().await;
-        let mut out: Vec<TaskMeta> = Vec::with_capacity(tasks.len());
-        for t in tasks.values() {
-            out.push(t.meta.read().await.clone());
+        if let Some(orch) = self.orch.upgrade() {
+            let mut value = value;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("repo".into(), json!(self.repo.path));
+            }
+            orch.emit(value);
         }
-        out.sort_by_key(|m| m.created_at);
-        out
-    }
-
-    pub async fn get(&self, id: &str) -> Option<Arc<Task>> {
-        self.tasks.read().await.get(id).cloned()
     }
 
     pub async fn create(
@@ -254,7 +408,6 @@ impl Hub {
         let ts = now_ms();
         let known_models = self.models.read().await.clone();
         let known_default = self.default_model.read().await.clone();
-        let model = model.or(known_default);
         let task = Arc::new(Task {
             meta: RwLock::new(TaskMeta {
                 id: id.clone(),
@@ -263,14 +416,14 @@ impl Hub {
                 worktree: wt,
                 base,
                 status: "idle".into(),
-                model,
+                model: model.or(known_default),
                 models: known_models,
                 usage: None,
                 created_at: ts,
                 updated_at: ts,
             }),
             items: RwLock::new(Vec::new()),
-            hub: Arc::downgrade(self),
+            ws: Arc::downgrade(self),
             agent: Mutex::new(None),
             session: RwLock::new(None),
             spawn_lock: Mutex::new(()),
@@ -283,13 +436,19 @@ impl Hub {
         self.emit(json!({ "type": "task", "task": *task.meta.read().await }));
         Ok(task)
     }
+
+    pub async fn task_count(&self) -> usize {
+        self.tasks.read().await.len()
+    }
 }
+
+/* ---------------------------------------------------------------- tasks */
 
 impl Task {
     /// Broadcast an event to every connected client.
     pub fn emit(&self, value: Value) {
-        if let Some(hub) = self.hub.upgrade() {
-            hub.emit(value);
+        if let Some(ws) = self.ws.upgrade() {
+            ws.emit(value);
         }
     }
 
@@ -313,10 +472,10 @@ impl Task {
 
     async fn persist(&self) {
         let (task, items) = self.snapshot().await;
-        let Some(hub) = self.hub.upgrade() else {
+        let Some(ws) = self.ws.upgrade() else {
             return;
         };
-        let dir = hub.dir.join("tasks");
+        let dir = ws.dir.join("tasks");
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
@@ -462,13 +621,17 @@ impl Task {
             return Ok(a.clone());
         }
 
-        let Some(hub) = self.hub.upgrade() else {
+        let Some(ws) = self.ws.upgrade() else {
+            return Err(anyhow!("this workspace is closed"));
+        };
+        let Some(orch) = ws.orch.upgrade() else {
             return Err(anyhow!("orch is shutting down"));
         };
+
         let (meta, _) = self.snapshot().await;
         let (tx, rx) = mpsc::channel(512);
         let cwd = PathBuf::from(&meta.worktree);
-        let acp = Acp::spawn(&hub.cfg.program, &hub.cfg.args, &cwd, tx)?;
+        let acp = Acp::spawn(&orch.cfg.program, &orch.cfg.args, &cwd, tx)?;
 
         let init = tokio::time::timeout(
             std::time::Duration::from_secs(60),
@@ -513,12 +676,10 @@ impl Task {
             .unwrap_or_default();
 
         if !models.is_empty() {
-            if let Some(hub) = self.hub.upgrade() {
-                *hub.models.write().await = models.clone();
-                let mut default = hub.default_model.write().await;
-                if default.is_none() {
-                    *default = self.meta.read().await.model.clone();
-                }
+            *ws.models.write().await = models.clone();
+            let mut default = ws.default_model.write().await;
+            if default.is_none() {
+                *default = self.meta.read().await.model.clone();
             }
         }
         {
@@ -782,11 +943,59 @@ impl Task {
             self.error("the agent process exited").await;
         }
     }
+
+    pub async fn diff(&self) -> Result<Value> {
+        let (meta, _) = self.snapshot().await;
+        let wt = PathBuf::from(&meta.worktree);
+        let _ = git(&wt, &["add", "-N", "-A"]).await;
+        let (_, stat, _) = git(&wt, &["diff", "--stat", &meta.base]).await?;
+        let (_, diff, _) = git(&wt, &["diff", &meta.base]).await?;
+        Ok(json!({ "stat": stat, "diff": diff }))
+    }
+
+    pub async fn commit(&self) -> Result<Value> {
+        let (meta, _) = self.snapshot().await;
+        let wt = PathBuf::from(&meta.worktree);
+        let _ = git(&wt, &["add", "-A"]).await;
+        let (ok, _, err) = git(&wt, &["commit", "-m", &format!("orch: {}", meta.title)]).await?;
+        let (_, status, _) = git(&wt, &["status", "--porcelain"]).await?;
+        if !ok && !status.is_empty() {
+            return Err(anyhow!("commit failed: {err}"));
+        }
+        let repo = self
+            .ws
+            .upgrade()
+            .map(|ws| ws.repo.path.clone())
+            .unwrap_or_else(|| meta.worktree.clone());
+        let message = format!(
+            "branch `{}` is ready. Merge it with:\n\n  git -C {} merge --no-ff {}",
+            meta.branch, repo, meta.branch
+        );
+        Ok(json!({ "ok": true, "message": message }))
+    }
+
+    pub async fn remove(self: &Arc<Self>) -> Result<()> {
+        let (meta, _) = self.snapshot().await;
+        let Some(ws) = self.ws.upgrade() else {
+            return Ok(());
+        };
+        ws.tasks.write().await.remove(&meta.id);
+        let repo = PathBuf::from(&ws.repo.path);
+        let wt = PathBuf::from(&meta.worktree);
+        let _ = git(&repo, &["worktree", "remove", "--force", &meta.worktree]).await;
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_file(ws.dir.join("tasks").join(format!("{}.json", meta.id)));
+        ws.emit(json!({ "type": "removed", "taskId": meta.id }));
+        *self.agent.lock().await = None;
+        Ok(())
+    }
 }
 
 async fn pump(task: Weak<Task>, mut rx: mpsc::Receiver<Incoming>) {
     while let Some(msg) = rx.recv().await {
-        let Some(task) = task.upgrade() else { break };
+        let Some(task) = task.upgrade() else {
+            break;
+        };
         match msg {
             Incoming::Notification { method, params } => {
                 if method == "session/update" {
@@ -872,53 +1081,6 @@ fn merge_tool(item: &mut Value, update: &Value) {
         }
     }
     item["output"] = json!(out);
-}
-
-impl Task {
-    pub async fn diff(&self) -> Result<Value> {
-        let (meta, _) = self.snapshot().await;
-        let wt = PathBuf::from(&meta.worktree);
-        let _ = git(&wt, &["add", "-N", "-A"]).await;
-        let (_, stat, _) = git(&wt, &["diff", "--stat", &meta.base]).await?;
-        let (_, diff, _) = git(&wt, &["diff", &meta.base]).await?;
-        Ok(json!({ "stat": stat, "diff": diff }))
-    }
-
-    pub async fn commit(&self) -> Result<Value> {
-        let (meta, _) = self.snapshot().await;
-        let wt = PathBuf::from(&meta.worktree);
-        let _ = git(&wt, &["add", "-A"]).await;
-        let (ok, _, err) = git(&wt, &["commit", "-m", &format!("orch: {}", meta.title)]).await?;
-        let (_, status, _) = git(&wt, &["status", "--porcelain"]).await?;
-        if !ok && !status.is_empty() {
-            return Err(anyhow!("commit failed: {err}"));
-        }
-        let repo = self
-            .hub
-            .upgrade()
-            .map(|h| h.repo.path.clone())
-            .unwrap_or_else(|| meta.worktree.clone());
-        let message = format!(
-            "branch `{}` is ready. Merge it with:\n\n  git -C {} merge --no-ff {}",
-            meta.branch, repo, meta.branch
-        );
-        Ok(json!({ "ok": true, "message": message }))
-    }
-
-    pub async fn remove(self: &Arc<Self>) -> Result<()> {
-        let (meta, _) = self.snapshot().await;
-        if let Some(hub) = self.hub.upgrade() {
-            hub.tasks.write().await.remove(&meta.id);
-            let repo = PathBuf::from(&hub.repo.path);
-            let wt = PathBuf::from(&meta.worktree);
-            let _ = git(&repo, &["worktree", "remove", "--force", &meta.worktree]).await;
-            let _ = std::fs::remove_dir_all(&wt);
-            let _ = std::fs::remove_file(hub.dir.join("tasks").join(format!("{}.json", meta.id)));
-            hub.emit(json!({ "type": "task", "task": null, "removed": meta.id }));
-        }
-        *self.agent.lock().await = None;
-        Ok(())
-    }
 }
 
 pub fn state_dir() -> PathBuf {
