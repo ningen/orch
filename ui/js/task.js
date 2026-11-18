@@ -75,12 +75,15 @@ export function renderHeader() {
   renderChangesActions();
 
   const busy = task.status === "running" || task.status === "waiting";
+  const started = Boolean(task.branch || task.sessionId);
   $("cancel").hidden = !busy;
   $("input").disabled = false;
   $("send").disabled = false;
   $("input").placeholder = busy
     ? "The agent is working — stop it first to send another message"
-    : "Describe the next step";
+    : started
+      ? "Describe the next step"
+      : "Describe what this task should do — the worktree and agent start on send";
 }
 
 /* ---------------------------------------------------------------- stream */
@@ -216,12 +219,27 @@ function paint(item) {
   }
 }
 
+/** A task that has not started yet has no transcript — point at the composer. */
+function renderEmpty() {
+  const task = currentTask();
+  if (!task || state.items.length || task.branch || task.sessionId) return;
+  const box = el("div", "stream-empty");
+  const lead = el("p", "empty-lead");
+  lead.textContent = "Describe what this task should do.";
+  const body = el("p", "empty-body");
+  body.textContent =
+    "The first message creates the worktree and starts the agent, and names the task from it. Nothing touches your repository until you merge.";
+  box.append(lead, body);
+  $("stream").appendChild(box);
+}
+
 export function renderStream() {
   const stream = $("stream");
   stream.textContent = "";
   state.nodes.clear();
   const sorted = [...state.items].sort((a, b) => (a.at || 0) - (b.at || 0));
   for (const item of sorted) paint(item);
+  renderEmpty();
   scrollToEnd(true);
 }
 
@@ -252,6 +270,8 @@ export function schedulePaintItem(item) {
 }
 
 export function upsertItem(item) {
+  const empty = $("stream").querySelector(".stream-empty");
+  if (empty) empty.remove();
   const existing = state.items.find((x) => x.id === item.id);
   if (existing) {
     Object.assign(existing, item);

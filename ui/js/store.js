@@ -81,6 +81,10 @@ export function inboxOrder() {
 export function setView(view) {
   state.view = view;
   $("app").dataset.view = view;
+  // `[hidden]` beats the layout rules, so the panes must be switched by
+  // attribute — data-view alone would leave the task view unrendered.
+  $("inbox-view").hidden = view !== "inbox";
+  $("task-view").hidden = view !== "task";
   if (view === "inbox") {
     state.inboxCursor = clampCursor();
     document.body.classList.remove("task-open");
