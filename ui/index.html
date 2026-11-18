@@ -114,30 +114,6 @@
 
 </div>
 
-<div class="modal" id="modal" hidden>
-  <form class="sheet" id="new-form">
-    <h2>New task</h2>
-    <label class="field">
-      <span class="label">repository</span>
-      <select id="new-repo"></select>
-    </label>
-    <label class="field">
-      <span class="label">first message <em>optional — names the task and creates its worktree</em></span>
-      <textarea id="new-prompt" rows="4" placeholder="Describe what the agent should do. Leave empty to start the task later."></textarea>
-    </label>
-    <label class="field">
-      <span class="label">model</span>
-      <select id="new-model"></select>
-    </label>
-    <div class="sheet-foot">
-      <span class="hint mono">esc to close</span>
-      <span class="spacer"></span>
-      <button type="button" class="btn ghost" id="new-cancel">cancel</button>
-      <button type="submit" class="btn primary">create task</button>
-    </div>
-  </form>
-</div>
-
 <div class="modal" id="repo-modal" hidden>
   <div class="sheet repo-sheet">
     <h2>Repositories</h2>

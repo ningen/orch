@@ -1068,59 +1068,21 @@ async function send() {
   }
 }
 
-function openModal() {
+async function newTask() {
   if (!state.currentRepo) {
     openRepoModal();
     return;
   }
-  $("modal").hidden = false;
-  $("new-prompt").value = "";
-  const repoSelect = $("new-repo");
-  repoSelect.textContent = "";
-  for (const repo of state.repos.values()) {
-    const opt = el("option");
-    opt.value = repo.path;
-    opt.textContent = repo.name;
-    opt.title = repo.path;
-    repoSelect.appendChild(opt);
-  }
-  repoSelect.value = state.currentRepo || "";
-  const select = $("new-model");
-  select.textContent = "";
-  const empty = el("option");
-  empty.value = "";
-  empty.textContent = "agent default";
-  select.appendChild(empty);
-  for (const option of state.models) {
-    const opt = el("option");
-    opt.value = option.value;
-    opt.textContent = option.name || option.value;
-    select.appendChild(opt);
-  }
-  setTimeout(() => $("new-prompt").focus(), 20);
-}
-
-function closeModal() {
-  $("modal").hidden = true;
-}
-
-async function createTask(event) {
-  event.preventDefault();
-  const prompt = $("new-prompt").value.trim();
-  const model = $("new-model").value || null;
-  const repo = $("new-repo").value || state.currentRepo;
-  const body = {};
-  if (prompt) body.prompt = prompt;
-  if (model) body.model = model;
-  if (repo) body.repo = repo;
   try {
-    const data = await api("/api/tasks", { method: "POST", body: JSON.stringify(body) });
-    closeModal();
-    // The task may belong to a repository other than the active one, and the
-    // daemon makes the chosen repository current. Reload before selecting it.
-    await refresh();
+    const data = await api("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ repo: state.currentRepo }),
+    });
+    const repo = activeRepo();
+    if (repo) repo.tasks.set(data.task.id, data.task);
     await selectTask(data.task.id);
     renderRail();
+    setTimeout(() => $("input").focus(), 20);
   } catch (error) {
     toast(error.message, true);
   }
@@ -1220,16 +1182,8 @@ function wire() {
     openRepo($("repo-path").value);
   });
 
-  $("new-task").addEventListener("click", openModal);
-  $("empty-new").addEventListener("click", () => {
-    if (state.currentRepo) openModal();
-    else openRepoModal();
-  });
-  $("new-cancel").addEventListener("click", closeModal);
-  $("new-form").addEventListener("submit", createTask);
-  $("modal").addEventListener("click", (event) => {
-    if (event.target === $("modal")) closeModal();
-  });
+  $("new-task").addEventListener("click", newTask);
+  $("empty-new").addEventListener("click", newTask);
 
   $("composer").addEventListener("submit", (event) => {
     event.preventDefault();
@@ -1361,7 +1315,6 @@ function wire() {
     if (event.key === "Escape") {
       if (!$("settings-modal").hidden) closeSettings();
       else if (!$("repo-modal").hidden) closeRepoModal();
-      else if (!$("modal").hidden) closeModal();
       return;
     }
     const typing =
@@ -1372,7 +1325,7 @@ function wire() {
 
     if (event.key === "n") {
       event.preventDefault();
-      openModal();
+      newTask();
       return;
     }
     if (event.key === "r") {
