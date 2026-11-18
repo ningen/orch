@@ -61,6 +61,7 @@ type Item =
       locations: string[];   // file paths touched
       input: unknown;        // rawInput, may be {}
       output: string;        // rendered text, may be ""
+      bodyOmitted?: boolean; // true in list responses: fetch the item to see input/output
     };
 ```
 
@@ -73,7 +74,8 @@ type Item =
 | POST | `/api/repos/current` | `{ path }` | switch to an already-open repository |
 | DELETE | `/api/repos` | `{ path }` | close a repository |
 | GET | `/api/browse?path=` | – | `{ path, parent, dirs: [{ name, path, repo }] }` |
-| GET | `/api/tasks/{id}` | – | `{ task: Task, items: Item[] }` |
+| GET | `/api/tasks/{id}` | – | `{ task, items: Item[], behind }` — tool items ship without `input`/`output` (`bodyOmitted: true`); fetch the body only when someone opens it |
+| GET | `/api/tasks/{id}/items/{itemId}` | – | one full `Item`, including a tool's `input` and `output` |
 | POST | `/api/tasks` | `{ title?, prompt?, model?, repo? }` | `{ task, items, repo }` |
 | POST | `/api/tasks/{id}/prompt` | `{ text }` | `{ ok: true }` |
 | POST | `/api/tasks/{id}/cancel` | – | `{ ok: true }` |
@@ -157,3 +159,6 @@ Clients should reconnect automatically (EventSource does this) and re-fetch
   They do not constrain an agent that runs tools on its own.
 - `POST /api/tasks/{id}/run` runs a shell command in the task worktree and
   streams `stdout`/`stderr` on SSE, finishing with a `stream: "exit"` frame.
+- Tool bodies are invisible unless sought: `GET /api/tasks/{id}` strips a
+  tool item's `input` and `output` and marks it `bodyOmitted`; the lens
+  fetches `GET /api/tasks/{id}/items/{itemId}` when the card is opened.

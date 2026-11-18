@@ -50,6 +50,7 @@ pub fn router(orch: Arc<Orch>) -> Router {
         .route("/api/browse", get(browse))
         .route("/api/tasks", post(create))
         .route("/api/tasks/{id}", get(show).delete(remove))
+        .route("/api/tasks/{id}/items/{item}", get(show_item))
         .route("/api/tasks/{id}/prompt", post(prompt))
         .route("/api/tasks/{id}/cancel", post(cancel))
         .route("/api/tasks/{id}/model", post(set_model))
@@ -214,13 +215,44 @@ fn home_dir() -> PathBuf {
 
 /* ------------------------------------------------------------------ tasks */
 
+/// A transcript item without the parts nobody asked to see. Tool inputs and
+/// outputs can be large (file contents, command tails); the list ships a
+/// one-line summary and the lens fetches the body only when it is opened.
+fn light_item(item: &Value) -> Value {
+    if item.get("kind").and_then(Value::as_str) != Some("tool") {
+        return item.clone();
+    }
+    let mut out = item.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("input".into(), json!({}));
+        obj.insert("output".into(), json!(""));
+        obj.insert("bodyOmitted".into(), json!(true));
+    }
+    out
+}
+
 async fn show(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
     let task = need_task(&orch, &id).await?;
     let (meta, items) = task.snapshot().await;
     let behind = task.behind().await;
+    let items = items.iter().map(light_item).collect::<Vec<_>>();
     Ok(Json(
         json!({ "task": meta, "items": items, "behind": behind }),
     ))
+}
+
+/// The full item — what a lens asks for when someone opens a tool body.
+async fn show_item(
+    State(orch): State<Arc<Orch>>,
+    Path((id, item_id)): Path<(String, String)>,
+) -> Api<Value> {
+    let task = need_task(&orch, &id).await?;
+    let (_, items) = task.snapshot().await;
+    let item = items
+        .into_iter()
+        .find(|i| i.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
+        .ok_or_else(|| ApiError(anyhow!("no such item: {item_id}")))?;
+    Ok(Json(item))
 }
 
 #[derive(Deserialize)]

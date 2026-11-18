@@ -84,6 +84,12 @@ export function renderHeader() {
     : started
       ? "Describe the next step"
       : "Describe what this task should do — the worktree and agent start on send";
+
+  // The composer is an exception mouth: before the first message it is the
+  // task's only content, afterwards it appears only when asked for.
+  const composing = !started || state.composerOpen;
+  $("composer").hidden = !composing;
+  $("instruct-open").hidden = composing;
 }
 
 /* ---------------------------------------------------------------- stream */
@@ -184,7 +190,9 @@ function paint(item) {
       const title = node.querySelector(".tool-title");
       if (title) title.textContent = item.title || "tool";
       const body = node.querySelector(".tool-body");
-      if (body) renderToolBody(body, item);
+      // A stripped item has no body to render; the lens fetches it when
+      // someone opens the card. Live items carry their body already.
+      if (body && !item.bodyOmitted) renderToolBody(body, item);
       return;
     }
     const card = el("div", "tool");
@@ -203,19 +211,41 @@ function paint(item) {
     head.append(caret, title, kind, badge, paths);
 
     const body = el("div", "tool-body");
-    renderToolBody(body, item);
+    if (!item.bodyOmitted) renderToolBody(body, item);
 
     card.append(head, body);
-    if (item.status === "in_progress" || item.status === "failed" || item.status === "pending") {
-      card.classList.add("open");
-    } else {
-      body.hidden = true;
-    }
-    head.addEventListener("click", () => {
+    body.hidden = true;
+    head.addEventListener("click", async () => {
       const open = card.classList.toggle("open");
       body.hidden = !open;
+      if (open) await ensureToolBody(item, body);
     });
     node.appendChild(card);
+  }
+}
+
+/* Tool bodies are fetched on demand: the list route ships one-line
+ * summaries, and only an opened card asks for the input and output. */
+const itemBodies = new Map(); // item id -> full item
+
+async function ensureToolBody(item, body) {
+  const taskId = state.current;
+  if (!taskId || !item.bodyOmitted) {
+    renderToolBody(body, item);
+    return;
+  }
+  try {
+    if (!itemBodies.has(item.id)) {
+      const full = await api(`/api/tasks/${taskId}/items/${encodeURIComponent(item.id)}`);
+      if (state.current !== taskId) return;
+      itemBodies.set(item.id, full);
+    }
+    const full = itemBodies.get(item.id);
+    for (const key of ["input", "output"]) item[key] = full[key];
+    item.bodyOmitted = false;
+    renderToolBody(body, item);
+  } catch (error) {
+    toast(error.message, true);
   }
 }
 
@@ -300,6 +330,7 @@ export function appendRun(event) {
 export function clearStream() {
   state.items = [];
   state.nodes.clear();
+  itemBodies.clear();
   $("stream").textContent = "";
   $("diff").textContent = "";
   $("diff-meta").textContent = "";
@@ -324,6 +355,7 @@ export async function selectTask(id) {
   const repo = activeRepo();
   if (!repo || !repo.tasks.has(id)) return;
   state.current = id;
+  state.composerOpen = false;
   setView("task");
   clearStream();
   renderHeader();
@@ -336,7 +368,20 @@ export async function selectTask(id) {
 
 export function backToInbox() {
   state.current = null;
+  state.composerOpen = false;
   setView("inbox");
+}
+
+/** Open the exception mouth: the composer, usually hidden behind a small
+ *  affordance. Cards' "instruct" actions lead here. */
+export function revealComposer() {
+  if (!state.current) return;
+  state.composerOpen = true;
+  $("instruct-open").hidden = true;
+  $("composer").hidden = false;
+  const input = $("input");
+  input.focus();
+  input.dispatchEvent(new Event("input"));
 }
 
 /* ---------------------------------------------------------------- checks */
@@ -513,6 +558,7 @@ async function copyPath() {
 
 export function wireTaskView() {
   $("back").addEventListener("click", backToInbox);
+  $("instruct-open").addEventListener("click", revealComposer);
 
   $("composer").addEventListener("submit", (event) => {
     event.preventDefault();

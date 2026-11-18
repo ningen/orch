@@ -101,8 +101,10 @@ PATH、コンテナ、bwrap）で縛る必要がある。
 
 | 操作 | 場所 | 内容 |
 | --- | --- | --- |
-| inbox | メインビュー | 判断が必要なタスクが例外カードで並ぶ。カードを開くと agent サマリ（参考情報）・receipt・policy の発見と `open / verify / merge / send back` が乗る |
-| 会話 | カードから open | transcript + composer + diff/verify inspector は「レンズ」。esc で inbox へ戻る |
+| inbox | メインビュー | 判断が必要なタスクが例外カードで並ぶ。カードは **next action を提示して選ばせる**: receipt と git 状態だけから決まる推奨行動（主 1 つ＋代替）で、`1`–`3` キーでも選べる。agent サマリは参考情報ラベルつき |
+| 会話 | カードから open | transcript + diff/verify inspector は「レンズ」。esc で inbox へ戻る |
+| instruct | カード / レンズ内 | 例外的な介入口。最初の 1 通だけ composer が主役で、以降は「instruct this agent…」を開いたときだけ出る |
+| ツールの入出力 | レンズ内 | **見ようとしなければ見えない**。transcript は 1 行サマリで配られ、カードを開いた時点で初めて中身を取得する |
 | rebase | changes パネル | base ブランチが進むと `rebase +N` が出る。失敗時は自動で abort |
 | reset | changes パネル | worktree を base コミットまで戻す（確認あり） |
 | copy path | changes パネル | worktree のパスをクリップボードへ |
@@ -155,12 +157,16 @@ src/main.rs    CLI
 - タスク作成 → worktree を切る → エージェント起動 → ストリーミング表示
 - 監督 inbox: 例外カード（agent error / verify failed / needs_review /
   base moved / 未検証）を優先度順に並べ、quiet は 1 行に畳む
+- **next action の提示と選択**: カードは receipt と git 状態から決まる推奨行動を
+  1 つ提示し、代替とともに選ばせる（`1`–`3`）。推奨は agent の自己申告を信用せず
+  決定論的に出す。merge だけは常に confirm を挟む
 - ターン終了後の自動 verify と receipt（head/base SHA、各コマンド結果）
 - diff policy（paths / added lines）と、override 明示付きの merge
 - base が動いたタスクの merge 拒否（rebase → verify → merge）
-- マルチターン（同じセッションに追加プロンプト）
+- マルチターン（同じセッションに追加プロンプト。composer は例外的な介入口）
 - タスクごとのモデル切替（エージェントが提示した選択肢から）
-- ツール呼び出しの可視化（write / bash / read など、入力と出力つき）
+- ツール呼び出しの可視化（write / bash / read など。入出力はカードを開いた
+  時点で初めて取得する — 見ようとしなければ見えない）
 - 変更 diff の表示（分岐元コミットとの比較）
 - 任意コマンドの実行と出力ストリーミング（`nix build` など）
 - トークン数とコストの表示

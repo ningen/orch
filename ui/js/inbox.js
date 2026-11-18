@@ -4,8 +4,8 @@
 // then quiet activity that needs nothing.
 
 import { $, el, api, ago, shortTokens, toast, shortSha } from "./util.js";
-import { state, activeRepo, repoTasks, classify, inboxOrder, setView } from "./store.js";
-import { selectTask, loadTask } from "./task.js";
+import { state, activeRepo, repoTasks, classify, inboxOrder, setView, nextAction } from "./store.js";
+import { selectTask, loadTask, revealComposer } from "./task.js";
 
 function currentTask() {
   const repo = activeRepo();
@@ -119,6 +119,33 @@ async function reloadTask(id) {
   }
 }
 
+/** Run a recommended action. `merge` always asks first — a wrong merge is
+ *  the most expensive mistake this surface can offer. */
+function runAction(task, action) {
+  switch (action.id) {
+    case "open":
+      selectTask(task.id);
+      return;
+    case "instruct":
+      selectTask(task.id).then(() => revealComposer());
+      return;
+    case "verify":
+      act(task.id, `/api/tasks/${task.id}/verify`);
+      return;
+    case "rebase":
+      act(task.id, `/api/tasks/${task.id}/rebase`);
+      return;
+    case "merge": {
+      if (action.confirm !== false && !window.confirm(`Merge "${task.title}" into ${task.baseRef || "the base branch"}?`)) {
+        return;
+      }
+      act(task.id, `/api/tasks/${task.id}/merge`, {});
+      return;
+    }
+    default:
+  }
+}
+
 function cardBody(task, payload) {
   const body = el("div", "card-body");
 
@@ -152,34 +179,28 @@ function cardBody(task, payload) {
     body.appendChild(line);
   }
 
+  // The offer: one recommended action, then the alternatives. Choosing is
+  // the human's whole job here — the buttons carry it, keys 1–3 pick them.
+  const gated = Boolean(state.settings && (state.settings.checks || []).length);
+  const rec = nextAction(task, state.behind[task.id] || 0, gated);
   const actions = el("div", "card-actions");
-  actions.appendChild(
-    actionButton("open", "primary", () => selectTask(task.id)),
-  );
-  if ((state.behind[task.id] || 0) > 0) {
-    actions.appendChild(
-      actionButton(`rebase +${state.behind[task.id]}`, "ghost", () =>
-        act(task.id, `/api/tasks/${task.id}/rebase`),
-      ),
-    );
-  }
-  const running = task.status === "running" || task.status === "waiting";
-  if (!running) {
-    actions.appendChild(
-      actionButton("verify", "", () => act(task.id, `/api/tasks/${task.id}/verify`)),
-    );
-    if (task.status !== "merged") {
-      actions.appendChild(
-        actionButton("merge", "", () => act(task.id, `/api/tasks/${task.id}/merge`, {})),
-      );
+  if (rec) {
+    if (rec.why) {
+      const why = el("div", "rec-why mono");
+      why.textContent = rec.why;
+      actions.appendChild(why);
     }
+    const primary = actionButton(rec.label, "primary", () => runAction(task, rec));
+    primary.dataset.slot = "1";
+    actions.appendChild(primary);
+    (rec.alternatives || []).forEach((alternative, index) => {
+      const btn = actionButton(alternative.label, "ghost", () => runAction(task, alternative));
+      btn.dataset.slot = String(index + 2);
+      actions.appendChild(btn);
+    });
+  } else {
+    actions.appendChild(actionButton("open", "ghost", () => selectTask(task.id)));
   }
-  actions.appendChild(
-    actionButton("send back", "ghost", () => {
-      selectTask(task.id);
-      setTimeout(() => $("input") && $("input").focus(), 60);
-    }),
-  );
   body.appendChild(actions);
   return body;
 }
@@ -250,6 +271,14 @@ function quietRow(task, cursor) {
     const badge = el("span", `check-badge ${task.verify.status}`);
     badge.textContent = task.verify.status.replace("_", " ");
     sub.append(badge);
+  }
+  // Calm things still say what they are waiting for, in one quiet word.
+  const gated = Boolean(state.settings && (state.settings.checks || []).length);
+  const rec = nextAction(task, state.behind[task.id] || 0, gated);
+  if (rec) {
+    const chip = el("span", "rec-chip mono");
+    chip.textContent = `next: ${rec.label}`;
+    sub.append(chip);
   }
 
   row.append(top, sub);

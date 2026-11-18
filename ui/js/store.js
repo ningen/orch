@@ -18,6 +18,7 @@ export const state = {
   unseen: 0,
   inboxCursor: 0, // index into the inbox order (attention then quiet)
   cardData: new Map(), // task id -> { items, behind } loaded for an expanded card
+  composerOpen: false, // the composer shows only when asked for (or before the first message)
 };
 
 export function activeRepo() {
@@ -102,4 +103,86 @@ function clampCursor() {
 export function cursorList() {
   const { attention, quiet } = inboxOrder();
   return [...attention, ...quiet];
+}
+
+/**
+ * The recommended next action for a task. Derived from the receipt, the
+ * status, and git state only — never from what the agent says about its
+ * own work. `null` means nothing needs a human decision right now.
+ */
+export function nextAction(task, behind, gated) {
+  if (!task) return null;
+  if (task.status === "running" || task.status === "waiting" || task.status === "merged") {
+    return null;
+  }
+  const alt = (id, label) => ({ id, label });
+  const started = Boolean(task.branch || task.sessionId);
+  const verify = task.verify;
+
+  if (task.status === "error") {
+    return {
+      id: "instruct",
+      label: "send back",
+      why: "the agent errored — steer it from the transcript",
+      alternatives: [alt("open", "read the transcript")],
+    };
+  }
+  if (verify && verify.status === "failed") {
+    return {
+      id: "instruct",
+      label: "send back",
+      why: "a check failed — the receipt has the output",
+      alternatives: [alt("open", "see the receipt"), alt("verify", "run verify again")],
+    };
+  }
+  if (verify && verify.status === "needs_review") {
+    const n = (verify.policy || []).length;
+    return {
+      id: "merge",
+      label: "accept & merge",
+      confirm: true,
+      why: `checks green · policy flagged ${n} finding${n === 1 ? "" : "s"}`,
+      alternatives: [alt("open", "see the findings"), alt("instruct", "send back")],
+    };
+  }
+  if (verify && verify.status === "passed" && behind > 0) {
+    return {
+      id: "rebase",
+      label: `rebase +${behind}`,
+      why: `the base moved ${behind} commit${behind === 1 ? "" : "s"} — the receipt is stale`,
+      alternatives: [alt("open", "open the task")],
+    };
+  }
+  if (verify && verify.status === "passed") {
+    return {
+      id: "merge",
+      label: "merge",
+      confirm: true,
+      why: "checks passed against the current base",
+      alternatives: [alt("open", "see the diff"), alt("instruct", "send back")],
+    };
+  }
+  if (!started) {
+    return {
+      id: "instruct",
+      label: "describe the task",
+      why: "nothing has started — the first message creates the worktree",
+      alternatives: [],
+    };
+  }
+  if (gated) {
+    return {
+      id: "verify",
+      label: "verify",
+      why: "no receipt for this worktree yet",
+      alternatives: [alt("open", "open the task")],
+    };
+  }
+  return {
+    id: "merge",
+    label: "merge",
+    confirm: true,
+    why: "no gate is configured for this repository",
+    alternatives: [alt("open", "see the diff")],
+  };
 }

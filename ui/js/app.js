@@ -239,6 +239,19 @@ function wire() {
         if (id) selectTask(id);
         return;
       }
+      // 1–3 pick the recommended action (and its alternatives) on the
+      // expanded card. Confirmations still fire, so keys cannot merge by
+      // accident.
+      if (event.key === "1" || event.key === "2" || event.key === "3") {
+        const open = document.querySelector("#attention-list .card.open");
+        if (!open) return;
+        const btn = open.querySelector(`.card-actions [data-slot="${event.key}"]`);
+        if (btn) {
+          event.preventDefault();
+          btn.click();
+        }
+        return;
+      }
     }
   });
 
