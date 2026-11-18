@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orch</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="rail">
+    <div class="rail-head">
+      <div class="repo">
+        <span class="repo-name" id="repo-name">orch</span>
+        <span class="repo-branch mono" id="repo-branch"></span>
+      </div>
+      <button class="btn-new" id="new-task" title="New task (n)">
+        <span class="plus">+</span> new task
+      </button>
+    </div>
+    <div class="task-list" id="task-list"></div>
+    <div class="rail-foot">
+      <span class="conn" id="conn"></span>
+      <span class="conn-label" id="conn-label">connecting</span>
+      <span class="spacer"></span>
+      <span class="count mono" id="task-count"></span>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <header class="topbar" id="topbar" hidden>
+      <div class="title-wrap">
+        <h1 id="task-title"></h1>
+        <div class="meta">
+          <span class="chip mono" id="task-branch"></span>
+          <span class="status" id="task-status"><i></i><span></span></span>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <label class="model">
+          <span class="label">model</span>
+          <select id="model-select"></select>
+        </label>
+        <span class="usage mono" id="task-usage"></span>
+        <button class="btn ghost" id="cancel" hidden>stop</button>
+        <button class="btn ghost" id="commit" title="Commit this worktree">commit</button>
+      </div>
+    </header>
+
+    <div class="stream" id="stream" aria-live="polite"></div>
+    <button class="jump" id="jump" hidden>jump to latest</button>
+
+    <form class="composer" id="composer" autocomplete="off">
+      <textarea id="input" rows="1" placeholder="Describe what this task should do" disabled></textarea>
+      <div class="composer-foot">
+        <span class="hint mono">enter send · shift+enter newline</span>
+        <span class="spacer"></span>
+        <button class="btn send" id="send" disabled>send</button>
+      </div>
+    </form>
+
+    <div class="empty" id="empty">
+      <div class="empty-inner">
+        <div class="empty-mark mono">orch</div>
+        <p class="empty-lead">A task is an isolated git worktree and one live agent.</p>
+        <p class="empty-body">
+          Nothing touches your working tree until you commit and merge. Create a task,
+          describe the change, then review the diff and the command output before anything lands.
+        </p>
+        <button class="btn primary" id="empty-new">Create the first task</button>
+        <p class="empty-keys mono">n new task · j k switch · enter send</p>
+      </div>
+    </div>
+  </main>
+
+  <aside class="inspector" id="inspector">
+    <div class="tabs">
+      <button class="tab active" data-tab="changes">changes</button>
+      <button class="tab" data-tab="run">run</button>
+      <span class="spacer"></span>
+      <button class="icon-btn" id="refresh-diff" title="Refresh diff">refresh</button>
+    </div>
+    <div class="pane" id="pane-changes">
+      <div class="diff-meta mono" id="diff-meta"></div>
+      <pre class="diff mono" id="diff"></pre>
+    </div>
+    <div class="pane" id="pane-run" hidden>
+      <form class="run-form" id="run-form">
+        <input id="run-cmd" class="mono" value="nix build" spellcheck="false" autocomplete="off">
+        <button class="btn" type="submit">run</button>
+      </form>
+      <pre class="run-out mono" id="run-out"></pre>
+    </div>
+  </aside>
+
+</div>
+
+<div class="modal" id="modal" hidden>
+  <form class="sheet" id="new-form">
+    <h2>New task</h2>
+    <label class="field">
+      <span class="label">title</span>
+      <input id="new-title" required placeholder="fix the flake check on aarch64" autocomplete="off">
+    </label>
+    <label class="field">
+      <span class="label">first prompt <em>optional</em></span>
+      <textarea id="new-prompt" rows="4" placeholder="The agent starts working immediately if you write something here."></textarea>
+    </label>
+    <label class="field">
+      <span class="label">model</span>
+      <select id="new-model"></select>
+    </label>
+    <div class="sheet-foot">
+      <span class="hint mono">esc to close</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="new-cancel">cancel</button>
+      <button type="submit" class="btn primary">create task</button>
+    </div>
+  </form>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
