@@ -30,6 +30,9 @@ options:
                  previous selection, or the current directory on first run)
   --port N       port to listen on (default: {port})
   --agent CMD    ACP agent command (default: {agent})
+  --title-model MODEL
+                 model used to name a task from its first message
+                 (default: a small model from the agent's catalogue)
   --no-browser   do not open the UI in a browser
   -h, --help     show this help
 
@@ -51,6 +54,7 @@ async fn main() -> Result<()> {
     let mut repo = PathBuf::from(".");
     let mut repo_given = false;
     let mut agent = DEFAULT_AGENT.to_string();
+    let mut title_model: Option<String> = None;
     let mut browser = true;
 
     let mut args = std::env::args().skip(1);
@@ -70,6 +74,9 @@ async fn main() -> Result<()> {
                 repo_given = true;
             }
             "--agent" => agent = args.next().context("--agent needs a value")?,
+            "--title-model" => {
+                title_model = Some(args.next().context("--title-model needs a value")?)
+            }
             "--no-browser" => browser = false,
             other => anyhow::bail!("unknown argument `{other}` (try --help)"),
         }
@@ -85,6 +92,7 @@ async fn main() -> Result<()> {
         Config {
             program,
             args: agent_args,
+            title_model,
         },
         root,
     );

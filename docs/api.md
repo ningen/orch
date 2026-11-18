@@ -18,9 +18,9 @@ type Usage = { used: number; size: number; cost: number };
 
 type Task = {
   id: string;          // "t_ab12cd"
-  title: string;
-  branch: string;      // "orch/<slug>"
-  worktree: string;    // absolute path
+  title: string;       // empty until the first message names the task
+  branch: string;      // "orch/<slug>-<id>"; empty until the task starts
+  worktree: string;    // absolute path; empty until the task starts
   status: TaskStatus;
   model: string | null;
   models: ModelOption[];
@@ -68,7 +68,7 @@ type Item =
 | DELETE | `/api/repos` | `{ path }` | close a repository |
 | GET | `/api/browse?path=` | – | `{ path, parent, dirs: [{ name, path, repo }] }` |
 | GET | `/api/tasks/{id}` | – | `{ task: Task, items: Item[] }` |
-| POST | `/api/tasks` | `{ title, prompt?, model? }` | `{ task, items }` |
+| POST | `/api/tasks` | `{ title?, prompt?, model?, repo? }` | `{ task, items, repo }` |
 | POST | `/api/tasks/{id}/prompt` | `{ text }` | `{ ok: true }` |
 | POST | `/api/tasks/{id}/cancel` | – | `{ ok: true }` |
 | POST | `/api/tasks/{id}/model` | `{ value }` | `{ task }` |
@@ -119,9 +119,12 @@ Clients should reconnect automatically (EventSource does this) and re-fetch
 
 ## Behaviour notes
 
-- `POST /api/tasks` creates a git worktree at
-  `<repo>/.orch/worktrees/<id>` on branch `orch/<slug>` and spawns one ACP agent
-  child process for that task. The optional `prompt` is sent immediately.
+- `POST /api/tasks` creates only a record. The git worktree is created when the
+  first message arrives, and its branch is named after the task title. When no
+  title is supplied, a small model reads the first message and proposes one
+  (`--title-model` overrides the choice). One ACP agent session is then spawned
+  for the task. `repo` names the target repository (it is opened if needed and
+  becomes current); without it the current repository is used.
 - `status` transitions: `idle` → `running` while the agent works, `waiting`
   when the agent asks for permission, `error` on a failed turn, `done` when the
   turn ends normally.

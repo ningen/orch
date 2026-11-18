@@ -106,12 +106,12 @@ function renderRail() {
     const top = el("div", "row-top");
     const dot = el("span", `dot ${task.status}`);
     const title = el("span", "row-title");
-    title.textContent = task.title;
+    title.textContent = task.title || "new task";
     top.append(dot, title);
 
     const sub = el("div", "row-sub");
     const branch = el("span", "sub-branch");
-    branch.textContent = task.branch;
+    branch.textContent = task.branch || "not started";
     const time = el("span");
     time.textContent = ago(task.updatedAt || task.createdAt);
     sub.append(branch, time);
@@ -181,9 +181,9 @@ function renderHeader() {
   empty.hidden = true;
   topbar.hidden = false;
 
-  $("task-title").textContent = task.title;
+  $("task-title").textContent = task.title || "new task";
   $("task-title").title = task.title;
-  $("task-branch").textContent = task.branch;
+  $("task-branch").textContent = task.branch || "not started";
   $("task-branch").title = task.branch;
 
   const status = $("task-status");
@@ -832,7 +832,7 @@ function notify(task, previous) {
   state.unseen += 1;
   document.title = `(${state.unseen}) orch`;
   if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-    const note = new Notification(task.title, {
+    const note = new Notification(task.title || "task finished", {
       body: task.status === "error" ? "failed" : "finished",
       tag: task.id,
     });
@@ -1074,8 +1074,17 @@ function openModal() {
     return;
   }
   $("modal").hidden = false;
-  $("new-title").value = "";
   $("new-prompt").value = "";
+  const repoSelect = $("new-repo");
+  repoSelect.textContent = "";
+  for (const repo of state.repos.values()) {
+    const opt = el("option");
+    opt.value = repo.path;
+    opt.textContent = repo.name;
+    opt.title = repo.path;
+    repoSelect.appendChild(opt);
+  }
+  repoSelect.value = state.currentRepo || "";
   const select = $("new-model");
   select.textContent = "";
   const empty = el("option");
@@ -1088,7 +1097,7 @@ function openModal() {
     opt.textContent = option.name || option.value;
     select.appendChild(opt);
   }
-  setTimeout(() => $("new-title").focus(), 20);
+  setTimeout(() => $("new-prompt").focus(), 20);
 }
 
 function closeModal() {
@@ -1097,18 +1106,19 @@ function closeModal() {
 
 async function createTask(event) {
   event.preventDefault();
-  const title = $("new-title").value.trim();
-  if (!title) return;
   const prompt = $("new-prompt").value.trim();
   const model = $("new-model").value || null;
-  const body = { title };
+  const repo = $("new-repo").value || state.currentRepo;
+  const body = {};
   if (prompt) body.prompt = prompt;
   if (model) body.model = model;
+  if (repo) body.repo = repo;
   try {
     const data = await api("/api/tasks", { method: "POST", body: JSON.stringify(body) });
     closeModal();
-    const repo = activeRepo();
-    if (repo) repo.tasks.set(data.task.id, data.task);
+    // The task may belong to a repository other than the active one, and the
+    // daemon makes the chosen repository current. Reload before selecting it.
+    await refresh();
     await selectTask(data.task.id);
     renderRail();
   } catch (error) {

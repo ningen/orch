@@ -21,6 +21,9 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 pub struct Config {
     pub program: String,
     pub args: Vec<String>,
+    /// Model used to name a task from its first message. When unset, a small
+    /// model is picked from the agent's catalogue.
+    pub title_model: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -108,6 +111,10 @@ pub struct Task {
     ws: Weak<Workspace>,
     agent: Mutex<Option<Arc<Acp>>>,
     session: RwLock<Option<String>>,
+    /// Session used only to name the task from its first message. Updates for
+    /// it are diverted into `title_buffer` instead of the transcript.
+    title_session: RwLock<Option<String>>,
+    title_buffer: Mutex<String>,
     spawn_lock: Mutex<()>,
     busy: AtomicBool,
     restored: AtomicBool,
@@ -146,6 +153,61 @@ fn slug(title: &str) -> String {
     let out = out.trim_matches('-').to_string();
     if out.is_empty() { "task".into() } else { out }
 }
+
+/// A short, single-line title from whatever the naming model replied with.
+fn clean_title(raw: &str) -> String {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let line = line
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '#' || c.is_whitespace())
+        .trim_start_matches("Title:")
+        .trim();
+    let mut out: String = line.chars().take(72).collect();
+    if line.chars().count() > 72 {
+        out = out.trim_end().to_string();
+    }
+    out.trim_matches(|c: char| c == '.' || c == '。').to_string()
+}
+
+fn fallback_title(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("task");
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let short: String = collapsed.chars().take(60).collect();
+    if short.trim().is_empty() {
+        "task".into()
+    } else {
+        short
+    }
+}
+
+/// Pick a small model from the agent's catalogue for naming tasks.
+fn pick_title_model(options: &[Value]) -> Option<String> {
+    let hints = [
+        "flash", "haiku", "mini", "small", "lightning", "lite", "nano", "free",
+    ];
+    for hint in hints {
+        for option in options {
+            let value = option.get("value").and_then(Value::as_str).unwrap_or("");
+            let name = option.get("name").and_then(Value::as_str).unwrap_or("");
+            if value.to_lowercase().contains(hint) || name.to_lowercase().contains(hint) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    options
+        .first()
+        .and_then(|o| o.get("value"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 
 fn dir_key(path: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -395,6 +457,8 @@ impl Workspace {
                 ws: Arc::downgrade(&ws),
                 agent: Mutex::new(None),
                 session: RwLock::new(None),
+                title_session: RwLock::new(None),
+                title_buffer: Mutex::new(String::new()),
                 spawn_lock: Mutex::new(()),
                 busy: AtomicBool::new(false),
                 restored: AtomicBool::new(true),
@@ -437,23 +501,6 @@ impl Workspace {
         model: Option<String>,
     ) -> Result<Arc<Task>> {
         let id = short_id();
-        let branch = format!("orch/{}-{}", slug(&title), &id[2..]);
-        let worktree = self.dir.join("worktrees").join(&id);
-
-        let repo = PathBuf::from(&self.repo.path);
-        let (ok, base, err) = git(&repo, &["rev-parse", "HEAD"]).await?;
-        if !ok {
-            return Err(anyhow!("cannot read HEAD: {err}"));
-        }
-        if let Some(parent) = worktree.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let wt = worktree.to_string_lossy().to_string();
-        let (ok, _, err) = git(&repo, &["worktree", "add", "-b", &branch, &wt, &base]).await?;
-        if !ok {
-            return Err(anyhow!("git worktree add failed: {err}"));
-        }
-
         let ts = now_ms();
         let known_models = self.models.read().await.clone();
         let known_default = self.default_model.read().await.clone();
@@ -461,16 +508,18 @@ impl Workspace {
             meta: RwLock::new(TaskMeta {
                 id: id.clone(),
                 title,
-                branch,
-                worktree: wt,
-                base,
+                // The worktree and branch are created from the first message,
+                // once a title has been chosen.
+                branch: String::new(),
+                worktree: String::new(),
+                base: String::new(),
                 status: "idle".into(),
                 model: model.or(known_default),
                 models: known_models,
                 usage: None,
                 created_at: ts,
                 updated_at: ts,
-                base_ref: self.repo.branch.clone(),
+                base_ref: String::new(),
                 session_id: None,
                 verify: None,
             }),
@@ -478,6 +527,8 @@ impl Workspace {
             ws: Arc::downgrade(self),
             agent: Mutex::new(None),
             session: RwLock::new(None),
+            title_session: RwLock::new(None),
+            title_buffer: Mutex::new(String::new()),
             spawn_lock: Mutex::new(()),
             busy: AtomicBool::new(false),
             restored: AtomicBool::new(false),
@@ -487,24 +538,6 @@ impl Workspace {
         self.tasks.write().await.insert(id.clone(), task.clone());
         task.persist().await;
         self.emit(json!({ "type": "task", "task": *task.meta.read().await }));
-
-        // Start the agent immediately so the model catalogue is known before
-        // the first prompt, and failures surface right away.
-        let warm = task.clone();
-        tokio::spawn(async move {
-            if let Err(error) = warm.ensure_agent().await {
-                if warm.items.read().await.is_empty() {
-                    warm.push_item(json!({
-                        "kind": "note",
-                        "id": format!("n_{}", uuid::Uuid::new_v4().simple()),
-                        "at": now_ms(),
-                        "text": format!("could not start the agent: {error:#}"),
-                        "tone": "error",
-                    }))
-                    .await;
-                }
-            }
-        });
         Ok(task)
     }
 
@@ -591,6 +624,164 @@ impl Task {
         self.persist().await;
     }
 
+    /// Create the worktree and, when the task has no title yet, name it from
+    /// the first message using a small model. Safe to call more than once.
+    async fn initialize(self: &Arc<Self>, first_prompt: &str) -> Result<()> {
+        let Some(ws) = self.ws.upgrade() else {
+            return Err(anyhow!("this workspace is closed"));
+        };
+        let meta = self.meta.read().await.clone();
+        let known_title = meta.title.trim().to_string();
+        if !meta.worktree.is_empty() && !known_title.is_empty() {
+            return Ok(());
+        }
+
+        let id = meta.id.clone();
+        let short = id.strip_prefix("t_").unwrap_or(&id).to_string();
+
+        let (branch, wt) = if meta.worktree.is_empty() {
+            let branch = if known_title.is_empty() {
+                format!("orch/task-{short}")
+            } else {
+                format!("orch/{}-{short}", slug(&known_title))
+            };
+            let repo = PathBuf::from(&ws.repo.path);
+            let (ok, base, err) = git(&repo, &["rev-parse", "HEAD"]).await?;
+            if !ok {
+                return Err(anyhow!("cannot read HEAD: {err}"));
+            }
+            let worktree = ws.dir.join("worktrees").join(&id);
+            if let Some(parent) = worktree.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let wt = worktree.to_string_lossy().to_string();
+            let (ok, _, err) = git(&repo, &["worktree", "add", "-b", &branch, &wt, &base]).await?;
+            if !ok {
+                return Err(anyhow!("git worktree add failed: {err}"));
+            }
+            {
+                let mut m = self.meta.write().await;
+                m.branch = branch.clone();
+                m.worktree = wt.clone();
+                m.base = base;
+                m.base_ref = ws.repo.branch.clone();
+                m.updated_at = now_ms();
+            }
+            self.persist().await;
+            self.emit(json!({ "type": "task", "task": *self.meta.read().await }));
+            if !known_title.is_empty() {
+                return Ok(());
+            }
+            (branch, wt)
+        } else {
+            (meta.branch.clone(), meta.worktree.clone())
+        };
+
+        // Name the task from the first message. Any failure falls back to the
+        // message itself so the task can still start.
+        let generated = async {
+            let agent = self.ensure_agent().await?;
+            self.title_from_agent(&agent, first_prompt).await
+        }
+        .await
+        .ok()
+        .filter(|title| !title.is_empty());
+        let title = generated.unwrap_or_else(|| fallback_title(first_prompt));
+
+        let renamed = format!("orch/{}-{short}", slug(&title));
+        let mut final_branch = branch;
+        if renamed != final_branch {
+            let (ok, _, err) = git(Path::new(&wt), &["branch", "-m", &renamed]).await?;
+            if ok {
+                final_branch = renamed;
+            } else {
+                eprintln!("could not rename branch to {renamed}: {err}");
+            }
+        }
+        {
+            let mut m = self.meta.write().await;
+            m.title = title;
+            m.branch = final_branch;
+            m.updated_at = now_ms();
+        }
+        self.persist().await;
+        self.emit(json!({ "type": "task", "task": *self.meta.read().await }));
+        Ok(())
+    }
+
+    /// Ask a small model for a title, using a throwaway session so the main
+    /// conversation stays clean.
+    async fn title_from_agent(self: &Arc<Self>, agent: &Arc<Acp>, prompt: &str) -> Result<String> {
+        let meta = self.meta.read().await.clone();
+        let session = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.request(
+                "session/new",
+                json!({ "cwd": meta.worktree, "mcpServers": [] }),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow!("the naming session timed out"))??;
+        let sid = session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("the agent returned no sessionId"))?
+            .to_string();
+
+        let options = session
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .and_then(|opts| {
+                opts.iter()
+                    .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+                    .and_then(|o| o.get("options"))
+                    .and_then(Value::as_array)
+            })
+            .map(|list| list.as_slice())
+            .unwrap_or_default();
+        let model = self
+            .ws
+            .upgrade()
+            .and_then(|ws| ws.orch.upgrade())
+            .and_then(|orch| orch.cfg.title_model.clone())
+            .or_else(|| pick_title_model(options));
+        if let Some(model) = model {
+            let _ = agent
+                .request(
+                    "session/set_config_option",
+                    json!({ "sessionId": sid, "configId": "model", "value": model }),
+                )
+                .await;
+        }
+
+        *self.title_buffer.lock().await = String::new();
+        *self.title_session.write().await = Some(sid.clone());
+
+        let instruction = format!(
+            "Name this coding task. Read the request and reply with a concise title \
+             of 3 to 6 words in the same language as the request. Reply with the title \
+             only: no quotes, no punctuation, no explanation, and do not use tools.\n\n\
+             Request:\n{prompt}"
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            agent.request(
+                "session/prompt",
+                json!({ "sessionId": sid, "prompt": [{ "type": "text", "text": instruction }] }),
+            ),
+        )
+        .await;
+
+        *self.title_session.write().await = None;
+        let text = std::mem::take(&mut *self.title_buffer.lock().await);
+        let _ = agent
+            .request("session/close", json!({ "sessionId": sid }))
+            .await;
+
+        result.map_err(|_| anyhow!("naming the task timed out"))??;
+        Ok(clean_title(&text))
+    }
+
     pub async fn prompt(self: &Arc<Self>, text: String) -> Result<()> {
         if self.busy.swap(true, Ordering::SeqCst) {
             return Err(anyhow!("the agent is still working on this task"));
@@ -617,7 +808,11 @@ impl Task {
 
         let task = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = task.run_turn(text).await {
+            let result = match task.initialize(&text).await {
+                Ok(()) => task.run_turn(text).await,
+                Err(error) => Err(error),
+            };
+            if let Err(e) = result {
                 task.error(&format!("{e:#}")).await;
             }
             task.busy.store(false, Ordering::SeqCst);
@@ -897,6 +1092,21 @@ impl Task {
         if self.replaying.load(Ordering::SeqCst) {
             return;
         }
+        let title_sid = self.title_session.read().await.clone();
+        if let Some(title_sid) = title_sid
+            && params.get("sessionId").and_then(Value::as_str) == Some(title_sid.as_str())
+        {
+            if let Some(update) = params.get("update")
+                && update.get("sessionUpdate").and_then(Value::as_str)
+                    == Some("agent_message_chunk")
+            {
+                let text = chunk_text(update);
+                if !text.is_empty() {
+                    self.title_buffer.lock().await.push_str(&text);
+                }
+            }
+            return;
+        }
         let Some(update) = params.get("update") else {
             return;
         };
@@ -1071,11 +1281,18 @@ impl Task {
     /// runs `nix build` fails for a reason that looks like its own mistake.
     pub async fn stage_intent(&self) -> Result<()> {
         let (meta, _) = self.snapshot().await;
+        if meta.worktree.is_empty() {
+            return Ok(());
+        }
         let _ = git(&PathBuf::from(&meta.worktree), &["add", "-N", "-A"]).await;
         Ok(())
     }
 
     pub async fn diff(&self) -> Result<Value> {
+        let (meta, _) = self.snapshot().await;
+        if meta.worktree.is_empty() {
+            return Ok(json!({ "stat": "", "diff": "" }));
+        }
         self.stage_intent().await.ok();
         let (meta, _) = self.snapshot().await;
         let wt = PathBuf::from(&meta.worktree);
@@ -1097,6 +1314,9 @@ impl Task {
     /// is what the verification cards keep.
     pub async fn exec(self: &Arc<Self>, command: &str, run_id: &str) -> Result<(i32, String)> {
         let (meta, _) = self.snapshot().await;
+        if meta.worktree.is_empty() {
+            return Err(anyhow!("this task has not started yet"));
+        }
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
             .arg(command)
@@ -1174,6 +1394,9 @@ impl Task {
     /// passing check still describes what would be committed.
     pub async fn fingerprint(&self) -> String {
         let (meta, _) = self.snapshot().await;
+        if meta.worktree.is_empty() {
+            return String::new();
+        }
         let wt = PathBuf::from(&meta.worktree);
         let (_, head, _) = git(&wt, &["rev-parse", "HEAD"]).await.unwrap_or_default();
         let (_, status, _) = git(&wt, &["status", "--porcelain"])
@@ -1209,6 +1432,10 @@ impl Task {
 
     /// Run every configured check, in order, against the current worktree.
     pub async fn verify(self: &Arc<Self>) -> Result<()> {
+        let (meta, _) = self.snapshot().await;
+        if meta.worktree.is_empty() {
+            return Err(anyhow!("this task has not started yet"));
+        }
         if self.busy.swap(true, Ordering::SeqCst) {
             return Err(anyhow!("the agent is still working on this task"));
         }
@@ -1329,7 +1556,7 @@ impl Task {
             return Err(anyhow!("the agent is still working on this task"));
         }
         let (meta, _) = self.snapshot().await;
-        if meta.base_ref.is_empty() {
+        if meta.base_ref.is_empty() || meta.worktree.is_empty() {
             return Err(anyhow!("no base branch was recorded for this task"));
         }
         let wt = PathBuf::from(&meta.worktree);
@@ -1354,6 +1581,9 @@ impl Task {
             return Err(anyhow!("the agent is still working on this task"));
         }
         let (meta, _) = self.snapshot().await;
+        if meta.worktree.is_empty() {
+            return Err(anyhow!("this task has not started yet"));
+        }
         let wt = PathBuf::from(&meta.worktree);
         let (ok, _, err) = git(&wt, &["reset", "--hard", &meta.base]).await?;
         if !ok {
@@ -1378,6 +1608,9 @@ impl Task {
     /// passed against exactly these contents.
     async fn commit_worktree(&self) -> Result<TaskMeta> {
         let (meta, _) = self.snapshot().await;
+        if meta.worktree.is_empty() {
+            return Err(anyhow!("this task has not started yet"));
+        }
         let has_checks = self
             .ws
             .upgrade()
@@ -1457,9 +1690,11 @@ impl Task {
         };
         ws.tasks.write().await.remove(&meta.id);
         let repo = PathBuf::from(&ws.repo.path);
-        let wt = PathBuf::from(&meta.worktree);
-        let _ = git(&repo, &["worktree", "remove", "--force", &meta.worktree]).await;
-        let _ = std::fs::remove_dir_all(&wt);
+        if !meta.worktree.is_empty() {
+            let wt = PathBuf::from(&meta.worktree);
+            let _ = git(&repo, &["worktree", "remove", "--force", &meta.worktree]).await;
+            let _ = std::fs::remove_dir_all(&wt);
+        }
         let _ = std::fs::remove_file(ws.dir.join("tasks").join(format!("{}.json", meta.id)));
         ws.emit(json!({ "type": "removed", "taskId": meta.id }));
         *self.agent.lock().await = None;

@@ -118,12 +118,12 @@
   <form class="sheet" id="new-form">
     <h2>New task</h2>
     <label class="field">
-      <span class="label">title</span>
-      <input id="new-title" required placeholder="fix the flake check on aarch64" autocomplete="off">
+      <span class="label">repository</span>
+      <select id="new-repo"></select>
     </label>
     <label class="field">
-      <span class="label">first prompt <em>optional</em></span>
-      <textarea id="new-prompt" rows="4" placeholder="The agent starts working immediately if you write something here."></textarea>
+      <span class="label">first message <em>optional — names the task and creates its worktree</em></span>
+      <textarea id="new-prompt" rows="4" placeholder="Describe what the agent should do. Leave empty to start the task later."></textarea>
     </label>
     <label class="field">
       <span class="label">model</span>

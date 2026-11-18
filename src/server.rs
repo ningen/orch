@@ -212,22 +212,29 @@ async fn show(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Valu
 
 #[derive(Deserialize)]
 struct CreateBody {
-    title: String,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 async fn create(State(orch): State<Arc<Orch>>, Json(body): Json<CreateBody>) -> Api<Value> {
-    let title = body.title.trim().to_string();
-    if title.is_empty() {
-        return Err(ApiError(anyhow!("title is required")));
-    }
-    let ws = orch
-        .current()
-        .await
-        .ok_or_else(|| ApiError(anyhow!("no repository is selected")))?;
+    let title = body
+        .title
+        .map(|title| title.trim().to_string())
+        .unwrap_or_default();
+    let ws = match body.repo.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(repo) => orch.open_workspace(FsPath::new(repo)).await?,
+        None => orch
+            .current()
+            .await
+            .ok_or_else(|| ApiError(anyhow!("no repository is selected")))?,
+    };
+    orch.set_current(&ws.repo.path).await;
     let task = ws.create(title, body.model).await?;
     if let Some(prompt) = body
         .prompt
@@ -237,7 +244,9 @@ async fn create(State(orch): State<Arc<Orch>>, Json(body): Json<CreateBody>) -> 
         task.prompt(prompt).await?;
     }
     let (meta, items) = task.snapshot().await;
-    Ok(Json(json!({ "task": meta, "items": items })))
+    Ok(Json(
+        json!({ "task": meta, "items": items, "repo": ws.repo.path }),
+    ))
 }
 
 #[derive(Deserialize)]

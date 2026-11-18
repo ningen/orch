@@ -51,6 +51,7 @@ orch --agent "gemini --acp"
 | `--repo PATH` | 最初に開くリポジトリ（省略可） |
 | `--port N` | 待ち受けポート（既定: 7717） |
 | `--agent CMD` | 起動する ACP エージェント |
+| `--title-model MODEL` | 最初のメッセージからタスク名を作るモデル（既定は軽量モデルを自動選択） |
 | `--no-browser` | ブラウザを開かない |
 
 状態は `$ORCH_HOME`（既定 `~/.orch`）に置く。worktree とタスクの JSON がここに入る。
