@@ -308,6 +308,9 @@ async fn run(
     Json(body): Json<RunBody>,
 ) -> Api<Value> {
     let task = need_task(&orch, &id).await?;
+    // A verification command usually reads the index (nix flakes do), so make
+    // freshly written files visible before running it.
+    task.stage_intent().await.ok();
     let (meta, _) = task.snapshot().await;
     let command = body.command.trim().to_string();
     if command.is_empty() {

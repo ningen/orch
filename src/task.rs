@@ -966,10 +966,22 @@ impl Task {
         }
     }
 
+    /// Mark new files as intent-to-add.
+    ///
+    /// Anything that reads the git index instead of the working tree cannot
+    /// see a fresh file otherwise: flake evaluation in particular reports the
+    /// path as missing, so an agent that adds a `.nix` file and immediately
+    /// runs `nix build` fails for a reason that looks like its own mistake.
+    pub async fn stage_intent(&self) -> Result<()> {
+        let (meta, _) = self.snapshot().await;
+        let _ = git(&PathBuf::from(&meta.worktree), &["add", "-N", "-A"]).await;
+        Ok(())
+    }
+
     pub async fn diff(&self) -> Result<Value> {
+        self.stage_intent().await.ok();
         let (meta, _) = self.snapshot().await;
         let wt = PathBuf::from(&meta.worktree);
-        let _ = git(&wt, &["add", "-N", "-A"]).await;
         let (_, stat, _) = git(&wt, &["diff", "--stat", &meta.base]).await?;
         let (_, diff, _) = git(&wt, &["diff", &meta.base]).await?;
         Ok(json!({ "stat": stat, "diff": diff }))
