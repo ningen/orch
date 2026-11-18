@@ -434,6 +434,24 @@ impl Workspace {
         self.tasks.write().await.insert(id.clone(), task.clone());
         task.persist().await;
         self.emit(json!({ "type": "task", "task": *task.meta.read().await }));
+
+        // Start the agent immediately so the model catalogue is known before
+        // the first prompt, and failures surface right away.
+        let warm = task.clone();
+        tokio::spawn(async move {
+            if let Err(error) = warm.ensure_agent().await {
+                if warm.items.read().await.is_empty() {
+                    warm.push_item(json!({
+                        "kind": "note",
+                        "id": format!("n_{}", uuid::Uuid::new_v4().simple()),
+                        "at": now_ms(),
+                        "text": format!("could not start the agent: {error:#}"),
+                        "tone": "error",
+                    }))
+                    .await;
+                }
+            }
+        });
         Ok(task)
     }
 
@@ -741,6 +759,10 @@ impl Task {
     }
 
     pub async fn set_model(self: &Arc<Self>, value: String) -> Result<()> {
+        // Remember the choice so the next task in this repository starts there.
+        if let Some(ws) = self.ws.upgrade() {
+            *ws.default_model.write().await = Some(value.clone());
+        }
         {
             let mut m = self.meta.write().await;
             m.model = Some(value.clone());

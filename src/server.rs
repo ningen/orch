@@ -69,11 +69,26 @@ impl IntoResponse for ApiError {
 type Api<T> = Result<Json<T>, ApiError>;
 
 fn asset(body: &'static str, mime: &'static str) -> Response {
-    ([(header::CONTENT_TYPE, mime)], body).into_response()
+    // The UI ships inside the binary; a cached page must never outlive it.
+    (
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 async fn index() -> Response {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        INDEX,
+    )
+        .into_response()
 }
 
 async fn need_task(orch: &Arc<Orch>, id: &str) -> Result<Arc<crate::task::Task>, ApiError> {

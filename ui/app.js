@@ -199,7 +199,13 @@ function renderHeader() {
     opt.textContent = option.name || option.value;
     select.appendChild(opt);
   }
-  if (task.model) select.value = task.model;
+  if (!(task.models || []).length) {
+    const pending = el("option");
+    pending.textContent = "no model yet";
+    select.appendChild(pending);
+  } else if (task.model) {
+    select.value = task.model;
+  }
   select.disabled = !(task.models || []).length;
   select.title = task.model || "";
 
