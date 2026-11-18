@@ -26,8 +26,8 @@ usage:
   orch [--repo PATH] [--port N] [--agent CMD] [--no-browser]
 
 options:
-  --repo PATH    repository to open first (default: the current directory,
-                 when it is a git repository)
+  --repo PATH    repository to open and select first (default: restore the
+                 previous selection, or the current directory on first run)
   --port N       port to listen on (default: {port})
   --agent CMD    ACP agent command (default: {agent})
   --no-browser   do not open the UI in a browser
@@ -89,9 +89,10 @@ async fn main() -> Result<()> {
         root,
     );
 
-    // The repository is optional: fall back to the one already open, or to
-    // nothing at all and let the UI pick one. An explicit `--repo` that is not
-    // a repository is a mistake worth failing on.
+    // The repository is optional: the current directory is opened when it is a
+    // git repository, but it only becomes the active one when `--repo` says so
+    // or when there is no previously selected repository to restore. An
+    // explicit `--repo` that is not a repository is a mistake worth failing on.
     let first = match std::fs::canonicalize(&repo) {
         Ok(path) if inside_git(&path) => Some(path),
         Ok(path) if repo_given => anyhow::bail!("{} is not a git repository", path.display()),
@@ -101,7 +102,7 @@ async fn main() -> Result<()> {
         }
         Err(_) => None,
     };
-    orch.restore(first.as_deref()).await?;
+    orch.restore(first.as_deref(), repo_given).await?;
 
     let app = server::router(Arc::clone(&orch));
     let listener = TcpListener::bind(("127.0.0.1", port))

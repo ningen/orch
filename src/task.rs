@@ -195,7 +195,11 @@ impl Orch {
     }
 
     /// Reopen every repository the daemon saw last time.
-    pub async fn restore(self: &Arc<Self>, first: Option<&Path>) -> Result<()> {
+    ///
+    /// `first` is the directory orch was started in; it is opened when it is a
+    /// repository. It only becomes the active one when `prefer_first` is set
+    /// (an explicit `--repo`) or when there is no saved selection to restore.
+    pub async fn restore(self: &Arc<Self>, first: Option<&Path>, prefer_first: bool) -> Result<()> {
         let registry: Registry = std::fs::read_to_string(self.registry_path())
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
@@ -212,18 +216,28 @@ impl Orch {
             }
         }
 
-        for path in order {
-            if let Err(error) = self.open_workspace(Path::new(&path)).await {
+        for path in &order {
+            if let Err(error) = self.open_workspace(Path::new(path)).await {
                 eprintln!("skipping {path}: {error:#}");
             }
         }
 
-        if let Some(current) = registry.current {
-            self.set_current(&current).await;
+        // Keep the user's last selection across restarts. Starting orch inside
+        // some repository must not yank the UI away from the one they chose.
+        let open: Vec<String> = self.workspaces.read().await.keys().cloned().collect();
+        let saved = registry.current.filter(|path| open.contains(path));
+        let fallback = open.first().cloned();
+        let current = if prefer_first {
+            first
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .map(|path| path.to_string_lossy().to_string())
+                .filter(|path| open.contains(path))
+        } else {
+            saved
         }
-        if let Some(path) = first {
-            let canonical = std::fs::canonicalize(path)?;
-            self.set_current(&canonical.to_string_lossy()).await;
+        .or(fallback);
+        if let Some(path) = current {
+            self.set_current(&path).await;
         }
         Ok(())
     }
@@ -315,6 +329,11 @@ impl Orch {
 
     pub async fn close_workspace(&self, path: &str) {
         self.workspaces.write().await.remove(path);
+        let is_current = self.current.read().await.as_deref() == Some(path);
+        if is_current {
+            let next = self.workspaces.read().await.keys().next().cloned();
+            *self.current.write().await = next;
+        }
         self.save_registry().await;
     }
 }
