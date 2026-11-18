@@ -25,7 +25,8 @@ usage:
   orch [--repo PATH] [--port N] [--agent CMD] [--no-browser]
 
 options:
-  --repo PATH    repository to open first (default: current directory)
+  --repo PATH    repository to open first (default: the current directory,
+                 when it is a git repository)
   --port N       port to listen on (default: {port})
   --agent CMD    ACP agent command (default: {agent})
   --no-browser   do not open the UI in a browser
@@ -47,6 +48,7 @@ environment:
 async fn main() -> Result<()> {
     let mut port = DEFAULT_PORT;
     let mut repo = PathBuf::from(".");
+    let mut repo_given = false;
     let mut agent = DEFAULT_AGENT.to_string();
     let mut browser = true;
 
@@ -62,7 +64,10 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             "--port" => port = args.next().context("--port needs a value")?.parse()?,
-            "--repo" => repo = PathBuf::from(args.next().context("--repo needs a value")?),
+            "--repo" => {
+                repo = PathBuf::from(args.next().context("--repo needs a value")?);
+                repo_given = true;
+            }
             "--agent" => agent = args.next().context("--agent needs a value")?,
             "--no-browser" => browser = false,
             other => anyhow::bail!("unknown argument `{other}` (try --help)"),
@@ -83,14 +88,18 @@ async fn main() -> Result<()> {
         root,
     );
 
-    // `--repo` may be absent from a cold start; restore whatever it finds.
-    let first = std::fs::canonicalize(&repo).ok();
-    if first.is_none() {
-        eprintln!(
-            "note: {} is not a directory, restoring the previous list",
-            repo.display()
-        );
-    }
+    // The repository is optional: fall back to the one already open, or to
+    // nothing at all and let the UI pick one. An explicit `--repo` that is not
+    // a repository is a mistake worth failing on.
+    let first = match std::fs::canonicalize(&repo) {
+        Ok(path) if inside_git(&path) => Some(path),
+        Ok(path) if repo_given => anyhow::bail!("{} is not a git repository", path.display()),
+        Ok(_) => None,
+        Err(error) if repo_given => {
+            return Err(error).with_context(|| format!("cannot open {}", repo.display()));
+        }
+        Err(_) => None,
+    };
     orch.restore(first.as_deref()).await?;
 
     let app = server::router(Arc::clone(&orch));
@@ -116,6 +125,18 @@ async fn main() -> Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Cheap ancestor walk: no subprocess, and it works for linked worktrees.
+fn inside_git(path: &std::path::Path) -> bool {
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
 }
 
 fn open_browser(url: &str) {
