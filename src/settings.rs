@@ -16,6 +16,14 @@ pub struct Settings {
     /// Substrings that orch refuses to execute on the user's behalf.
     #[serde(default = "default_deny")]
     pub deny: Vec<String>,
+    /// Glob patterns for changed paths a verify result should flag for
+    /// review. Matching does not fail the checks by itself; it makes the
+    /// receipt say `needs_review` so a human looks before merging.
+    #[serde(default, alias = "policyPaths")]
+    pub policy_paths: Vec<String>,
+    /// Substrings for added lines that should flag the change for review.
+    #[serde(default, alias = "policyLines")]
+    pub policy_lines: Vec<String>,
 }
 
 fn default_deny() -> Vec<String> {
@@ -77,5 +85,124 @@ impl Settings {
             out.push("uv run pytest".to_string());
         }
         out
+    }
+
+    /// Patterns that make an agent's own work weaker: skipping tests,
+    /// disabling type checks, editing CI. Suggested, never forced.
+    pub fn suggested_policy(root: &Path) -> (Vec<String>, Vec<String>) {
+        let mut paths = Vec::new();
+        let mut lines = Vec::new();
+        if root.join(".github").exists() {
+            paths.push(".github/workflows/*".to_string());
+        }
+        if root.join("Cargo.toml").exists() {
+            lines.push("#[ignore]".to_string());
+        }
+        if root.join("package.json").exists() {
+            lines.push("it.skip".to_string());
+            lines.push("describe.skip".to_string());
+            lines.push("test.skip".to_string());
+            lines.push("@ts-nocheck".to_string());
+        }
+        if root.join("flake.nix").exists() {
+            paths.push("flake.lock".to_string());
+        }
+        (paths, lines)
+    }
+}
+
+/// Minimal glob: `*` matches any run of characters (including `/`), `?`
+/// matches one. Everything else is literal.
+pub fn glob_match(pattern: &str, path: &str) -> bool {
+    fn inner(p: &[u8], s: &[u8]) -> bool {
+        if p.is_empty() {
+            return s.is_empty();
+        }
+        match p[0] {
+            b'*' => {
+                // Collapse consecutive stars, then try every split.
+                let rest = &p[1..];
+                if rest.first() == Some(&b'*') {
+                    return inner(rest, s);
+                }
+                for i in 0..=s.len() {
+                    if inner(rest, &s[i..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            b'?' => !s.is_empty() && inner(&p[1..], &s[1..]),
+            literal => !s.is_empty() && s[0] == literal && inner(&p[1..], &s[1..]),
+        }
+    }
+    inner(pattern.as_bytes(), path.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_matches_within_segments() {
+        assert!(glob_match("*.nix", "flake.nix"));
+        assert!(glob_match("*.nix", "hosts/default.nix"));
+        assert!(!glob_match("*.nix", "flake.toml"));
+        assert!(glob_match("test/*", "test/util.rs"));
+        assert!(glob_match("test/*", "test/a/b.rs")); // `*` crosses `/`
+        assert!(!glob_match("test/*", "src/main.rs"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "abbc"));
+        assert!(glob_match("exact.rs", "exact.rs"));
+        assert!(!glob_match("exact.rs", "other.rs"));
+    }
+
+    #[test]
+    fn glob_edge_cases() {
+        assert!(glob_match("*", "anything/at/all"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+        assert!(glob_match("**", "deep/path"));
+        // `*` crosses `/`, so a workflow guard also covers nested jobs.
+        assert!(glob_match(
+            ".github/workflows/*",
+            ".github/workflows/ci.yml"
+        ));
+        assert!(glob_match(
+            ".github/workflows/*",
+            ".github/workflows/jobs/ci.yml"
+        ));
+    }
+
+    #[test]
+    fn settings_roundtrip_keeps_policy() {
+        let dir = std::env::temp_dir().join(format!("orch-test-{}", std::process::id()));
+        let settings = Settings {
+            checks: vec!["cargo test".into()],
+            deny: default_deny(),
+            policy_paths: vec![".github/workflows/*".into()],
+            policy_lines: vec!["#[ignore]".into()],
+        };
+        settings.save(&dir).unwrap();
+        let loaded = Settings::load(&dir);
+        assert_eq!(loaded.policy_paths, settings.policy_paths);
+        assert_eq!(loaded.policy_lines, settings.policy_lines);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_settings_files_still_load() {
+        let dir = std::env::temp_dir().join(format!("orch-test-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"checks":["cargo test"],"deny":["git push"]}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&dir);
+        assert_eq!(loaded.checks, vec!["cargo test".to_string()]);
+        assert!(loaded.policy_paths.is_empty());
+        assert!(loaded.policy_lines.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

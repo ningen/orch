@@ -22,17 +22,26 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 const INDEX: &str = include_str!("../ui/index.html");
-const APP_JS: &str = include_str!("../ui/app.js");
 const STYLE: &str = include_str!("../ui/style.css");
+const APP_JS: &str = include_str!("../ui/js/app.js");
+const INBOX_JS: &str = include_str!("../ui/js/inbox.js");
+const TASK_JS: &str = include_str!("../ui/js/task.js");
+const MODALS_JS: &str = include_str!("../ui/js/modals.js");
+const MARKDOWN_JS: &str = include_str!("../ui/js/markdown.js");
+const STORE_JS: &str = include_str!("../ui/js/store.js");
+const UTIL_JS: &str = include_str!("../ui/js/util.js");
 
 pub fn router(orch: Arc<Orch>) -> Router {
     Router::new()
         .route("/", get(index))
-        .route(
-            "/app.js",
-            get(|| async { asset(APP_JS, "text/javascript") }),
-        )
         .route("/style.css", get(|| async { asset(STYLE, "text/css") }))
+        .route("/js/app.js", get(|| async { js(APP_JS) }))
+        .route("/js/inbox.js", get(|| async { js(INBOX_JS) }))
+        .route("/js/task.js", get(|| async { js(TASK_JS) }))
+        .route("/js/modals.js", get(|| async { js(MODALS_JS) }))
+        .route("/js/markdown.js", get(|| async { js(MARKDOWN_JS) }))
+        .route("/js/store.js", get(|| async { js(STORE_JS) }))
+        .route("/js/util.js", get(|| async { js(UTIL_JS) }))
         .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
         .route("/api/state", get(state))
         .route("/api/events", get(events))
@@ -81,6 +90,10 @@ fn asset(body: &'static str, mime: &'static str) -> Response {
         body,
     )
         .into_response()
+}
+
+fn js(body: &'static str) -> Response {
+    asset(body, "text/javascript; charset=utf-8")
 }
 
 async fn index() -> Response {
@@ -227,7 +240,12 @@ async fn create(State(orch): State<Arc<Orch>>, Json(body): Json<CreateBody>) -> 
         .title
         .map(|title| title.trim().to_string())
         .unwrap_or_default();
-    let ws = match body.repo.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    let ws = match body
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         Some(repo) => orch.open_workspace(FsPath::new(repo)).await?,
         None => orch
             .current()
@@ -290,9 +308,21 @@ async fn set_model(
     Ok(Json(json!({ "task": meta })))
 }
 
-async fn merge(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
+#[derive(Deserialize)]
+struct MergeBody {
+    /// Accept a `needs_review` receipt (policy findings) explicitly.
+    #[serde(default)]
+    force: bool,
+}
+
+async fn merge(
+    State(orch): State<Arc<Orch>>,
+    Path(id): Path<String>,
+    body: Option<Json<MergeBody>>,
+) -> Api<Value> {
+    let force = body.map(|Json(b)| b.force).unwrap_or(false);
     let task = need_task(&orch, &id).await?;
-    Ok(Json(task.merge().await?))
+    Ok(Json(task.merge(force).await?))
 }
 
 async fn verify(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Value> {
@@ -386,16 +416,22 @@ async fn get_settings(
         .ok_or_else(|| ApiError(anyhow!("that repository is not open: {path}")))?;
     let settings = ws.settings.read().await.clone();
     let suggested = Settings::suggested(FsPath::new(&ws.repo.path));
+    let (policy_paths, policy_lines) = Settings::suggested_policy(FsPath::new(&ws.repo.path));
     Ok(Json(json!({
         "repo": path,
         "dir": ws.dir,
         "checks": settings.checks,
         "deny": settings.deny,
+        "policyPaths": settings.policy_paths,
+        "policyLines": settings.policy_lines,
         "suggested": suggested,
+        "suggestedPolicyPaths": policy_paths,
+        "suggestedPolicyLines": policy_lines,
     })))
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SettingsBody {
     #[serde(default)]
     repo: Option<String>,
@@ -403,6 +439,10 @@ struct SettingsBody {
     checks: Vec<String>,
     #[serde(default)]
     deny: Vec<String>,
+    #[serde(default)]
+    policy_paths: Vec<String>,
+    #[serde(default)]
+    policy_lines: Vec<String>,
 }
 
 async fn put_settings(State(orch): State<Arc<Orch>>, Json(body): Json<SettingsBody>) -> Api<Value> {
@@ -412,25 +452,34 @@ async fn put_settings(State(orch): State<Arc<Orch>>, Json(body): Json<SettingsBo
         .await
         .ok_or_else(|| ApiError(anyhow!("that repository is not open: {path}")))?;
 
-    let settings = Settings {
-        checks: body
-            .checks
-            .into_iter()
+    // Comment lines make sense only in the checks textarea; a policy or
+    // deny pattern may legitimately start with `#` (e.g. `#[ignore]`).
+    let clean_checks = |list: Vec<String>| {
+        list.into_iter()
             .map(|line| line.trim().to_string())
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .collect(),
-        deny: body
-            .deny
-            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    let clean_patterns = |list: Vec<String>| {
+        list.into_iter()
             .map(|line| line.trim().to_string())
             .filter(|line| !line.is_empty())
-            .collect(),
+            .collect::<Vec<_>>()
+    };
+    let settings = Settings {
+        checks: clean_checks(body.checks),
+        deny: clean_patterns(body.deny),
+        policy_paths: clean_patterns(body.policy_paths),
+        policy_lines: clean_patterns(body.policy_lines),
     };
     settings.save(&ws.dir)?;
     *ws.settings.write().await = settings.clone();
-    Ok(Json(
-        json!({ "checks": settings.checks, "deny": settings.deny }),
-    ))
+    Ok(Json(json!({
+        "checks": settings.checks,
+        "deny": settings.deny,
+        "policyPaths": settings.policy_paths,
+        "policyLines": settings.policy_lines,
+    })))
 }
 
 /* ------------------------------------------------------------------ events */

@@ -10,7 +10,7 @@ All request and response bodies are JSON. Errors return a non-2xx status with
 ## Types
 
 ```ts
-type TaskStatus = "idle" | "running" | "waiting" | "done" | "error";
+type TaskStatus = "idle" | "running" | "waiting" | "done" | "error" | "merged";
 
 type ModelOption = { value: string; name: string };
 
@@ -32,11 +32,17 @@ type Task = {
   verify: Verify | null;
 };
 
+// A verify run is a receipt: it names the commits it describes.
 type Verify = {
-  status: "passed" | "failed";
+  status: "passed" | "failed" | "needs_review";
   at: number;
   fingerprint: string;         // worktree contents this result describes
+  headSha: string;            // task branch at verify time
+  baseSha: string;            // base branch it was evaluated against
   commands: { command: string; code: number }[];
+  policy: { kind: "path" | "line"; pattern: string; path: string }[];
+  // "needs_review" means the checks were green but the diff policy found
+  // something a human should look at; merging then needs { force: true }.
 };
 
 // Ordered transcript entries. Items are upserted by `id`.
@@ -72,15 +78,15 @@ type Item =
 | POST | `/api/tasks/{id}/prompt` | `{ text }` | `{ ok: true }` |
 | POST | `/api/tasks/{id}/cancel` | – | `{ ok: true }` |
 | POST | `/api/tasks/{id}/model` | `{ value }` | `{ task }` |
-| POST | `/api/tasks/{id}/merge` | – | commit, then merge when the repository is clean |
-| POST | `/api/tasks/{id}/verify` | – | run the repository's checks (result on SSE) |
+| POST | `/api/tasks/{id}/merge` | `{ force?: boolean }` | commit, then merge when the repository is clean; refuses a stale base or a `needs_review` receipt without `force` |
+| POST | `/api/tasks/{id}/verify` | – | run the repository's checks and diff policy (result on SSE) |
 | POST | `/api/tasks/{id}/rebase` | – | replay onto the base branch, aborting on conflict |
 | POST | `/api/tasks/{id}/reset` | – | discard the worktree and return to the base commit |
 | DELETE | `/api/tasks/{id}` | – | `{ ok: true }` |
 | GET | `/api/tasks/{id}/diff` | – | `{ stat, diff }` (unified diff vs. merge base) |
 | POST | `/api/tasks/{id}/run` | `{ command }` | `{ ok: true }` (output arrives on SSE) |
-| GET | `/api/settings?repo=` | – | `{ repo, dir, checks, deny, suggested }` |
-| PUT | `/api/settings` | `{ repo?, checks, deny }` | same shape as `GET` |
+| GET | `/api/settings?repo=` | – | `{ repo, dir, checks, deny, policyPaths, policyLines, suggested, suggestedPolicyPaths, suggestedPolicyLines }` |
+| PUT | `/api/settings` | `{ repo?, checks, deny, policyPaths, policyLines }` | same shape as `GET` |
 | GET | `/api/events` | – | `text/event-stream` |
 
 `RepoSummary` is what `/api/state` returns per open repository:
@@ -90,7 +96,7 @@ type RepoSummary = {
   path: string;      // absolute path, also the workspace key
   name: string;      // last path component
   branch: string;    // current HEAD branch
-  tasks: Task[];
+  tasks: (Task & { behind: number })[];  // commits the base has that the task does not
 };
 ```
 
@@ -127,11 +133,15 @@ Clients should reconnect automatically (EventSource does this) and re-fetch
   becomes current); without it the current repository is used.
 - `status` transitions: `idle` → `running` while the agent works, `waiting`
   when the agent asks for permission, `error` on a failed turn, `done` when the
-  turn ends normally.
+  turn ends normally, `merged` after a successful merge.
 - `GET /api/tasks/{id}/diff` compares the worktree against the merge base with
   the repo's default branch, so it shows everything the task changed.
 - `GET /api/tasks/{id}` also returns `behind`: how many commits the base branch
-  has that this task does not.
+  has that this task does not. `/api/state` carries the same number per task.
+- When a turn ends normally and checks are configured, verify runs
+  automatically: the receipt arrives on SSE without a human clicking. A
+  receipt names the `headSha` and `baseSha` it describes; a passing receipt
+  whose base has moved (`behind > 0`) is stale and `merge` refuses it.
 - Verification settings live in the daemon's state directory
   (`<project>/settings.json`), never in the repository: an agent must not be
   able to edit the gate that judges it. `suggested` is a guess derived from
@@ -139,6 +149,10 @@ Clients should reconnect automatically (EventSource does this) and re-fetch
 - Checks are run in order inside the worktree. A configured check that has not
   passed against the current worktree blocks `merge`; changing a file after a
   passing run invalidates it.
+- The diff policy (`policyPaths` globs, `policyLines` substrings in added
+  lines) never fails the checks by itself. Findings are attached to the
+  receipt as `needs_review`; merging then requires `{ force: true }`, which is
+  recorded in the transcript.
 - `deny` patterns are refused for commands the daemon executes (verify, run).
   They do not constrain an agent that runs tools on its own.
 - `POST /api/tasks/{id}/run` runs a shell command in the task worktree and

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,7 +8,7 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<div class="app">
+<div class="app" id="app" data-view="inbox">
 
   <aside class="rail">
     <div class="rail-head">
@@ -23,7 +23,10 @@
         <span class="plus">+</span> new task
       </button>
     </div>
-    <div class="task-list" id="task-list"></div>
+    <div class="rail-note mono">
+      orch is a supervisor: agents work in isolated worktrees, the gate
+      verifies, and you decide what lands.
+    </div>
     <div class="rail-foot">
       <span class="conn" id="conn"></span>
       <span class="conn-label" id="conn-label">connecting</span>
@@ -32,50 +35,61 @@
     </div>
   </aside>
 
-  <main class="main" id="main">
-    <header class="topbar" id="topbar" hidden>
-      <div class="title-wrap">
-        <h1 id="task-title"></h1>
-        <div class="meta">
-          <span class="chip mono" id="task-branch"></span>
-          <span class="status" id="task-status"><i></i><span></span></span>
+  <main class="main">
+
+    <section class="inbox" id="inbox-view">
+      <header class="inbox-head">
+        <h1 id="inbox-title">attention</h1>
+        <span class="inbox-counts mono" id="inbox-counts"></span>
+        <span class="spacer"></span>
+        <span class="hint mono">n new · j k move · enter open · esc back</span>
+      </header>
+      <div class="inbox-scroll">
+        <div id="attention-list"></div>
+        <div class="quiet-head mono" id="quiet-head" hidden>quiet — nothing needed</div>
+        <div id="quiet-list"></div>
+        <div class="inbox-empty" id="inbox-empty" hidden>
+          <p class="empty-lead" id="inbox-empty-lead">No tasks yet.</p>
+          <p class="empty-body">Create a task, describe the change, and let the agent work
+          in its own worktree. Verify evidence lands here when it finishes.</p>
         </div>
       </div>
-      <div class="topbar-right">
-        <label class="model">
-          <span class="label">model</span>
-          <select id="model-select"></select>
-        </label>
-        <span class="usage mono" id="task-usage"></span>
-        <button class="btn ghost" id="cancel" hidden>stop</button>
-        <button class="btn ghost" id="commit" title="Commit this worktree">commit</button>
-      </div>
-    </header>
+    </section>
 
-    <div class="stream" id="stream" aria-live="polite"></div>
-    <button class="jump" id="jump" hidden>jump to latest</button>
+    <section class="task-view" id="task-view" hidden>
+      <header class="topbar" id="topbar" hidden>
+        <button class="btn ghost back" id="back" title="Back to inbox (esc)">‹ inbox</button>
+        <div class="title-wrap">
+          <h1 id="task-title"></h1>
+          <div class="meta">
+            <span class="chip mono" id="task-branch"></span>
+            <span class="status" id="task-status"><i></i><span></span></span>
+          </div>
+        </div>
+        <div class="topbar-right">
+          <label class="model">
+            <span class="label">model</span>
+            <select id="model-select"></select>
+          </label>
+          <span class="usage mono" id="task-usage"></span>
+          <button class="btn ghost" id="cancel" hidden>stop</button>
+          <button class="btn ghost" id="commit" title="Commit and merge this worktree">merge</button>
+        </div>
+      </header>
 
-    <form class="composer" id="composer" autocomplete="off">
-      <textarea id="input" rows="1" placeholder="Describe what this task should do" disabled></textarea>
-      <div class="composer-foot">
-        <span class="hint mono">enter send · shift+enter newline</span>
-        <span class="spacer"></span>
-        <button class="btn send" id="send" disabled>send</button>
-      </div>
-    </form>
+      <div class="stream" id="stream" aria-live="polite"></div>
+      <button class="jump" id="jump" hidden>jump to latest</button>
 
-    <div class="empty" id="empty">
-      <div class="empty-inner">
-        <div class="empty-mark mono">orch</div>
-        <p class="empty-lead" id="empty-lead">A task is an isolated git worktree and one live agent.</p>
-        <p class="empty-body" id="empty-body">
-          Nothing touches your working tree until you commit and merge. Create a task,
-          describe the change, then review the diff and the command output before anything lands.
-        </p>
-        <button class="btn primary" id="empty-new">Create the first task</button>
-        <p class="empty-keys mono">n new task · r repositories · j k switch · enter send</p>
-      </div>
-    </div>
+      <form class="composer" id="composer" autocomplete="off">
+        <textarea id="input" rows="1" placeholder="Describe what this task should do" disabled></textarea>
+        <div class="composer-foot">
+          <span class="hint mono">enter send · shift+enter newline</span>
+          <span class="spacer"></span>
+          <button class="btn send" id="send" disabled>send</button>
+        </div>
+      </form>
+    </section>
+
   </main>
 
   <aside class="inspector" id="inspector">
@@ -103,6 +117,7 @@
         <button class="btn" id="check-run">verify</button>
       </div>
       <div class="check-list" id="check-list"></div>
+      <div class="receipt" id="receipt" hidden></div>
       <div class="run-sep mono">run a command</div>
       <form class="run-form" id="run-form">
         <input id="run-cmd" class="mono" value="nix build" spellcheck="false" autocomplete="off">
@@ -142,23 +157,35 @@
 </div>
 
 <div class="modal" id="settings-modal" hidden>
-  <form class="sheet" id="settings-form">
-    <h2>Checks</h2>
-    <p class="sheet-note">Kept in <span class="mono" id="settings-path"></span> — not in the repository, so an agent cannot rewrite its own gate.</p>
+  <form class="sheet gate-sheet" id="settings-form">
+    <h2>Gate</h2>
+    <p class="sheet-note">Kept in <span class="mono" id="settings-path"></span> — not in the repository, so an agent cannot rewrite the gate that judges it.</p>
     <label class="field">
       <span class="label">verify commands <em>one per line, run in order</em></span>
-      <textarea id="settings-checks" rows="6" class="mono" spellcheck="false"></textarea>
+      <textarea id="settings-checks" rows="5" class="mono" spellcheck="false"></textarea>
     </label>
     <div class="suggest" id="settings-suggest" hidden>
       <span class="label">suggested</span>
       <div class="suggest-list" id="suggest-list"></div>
     </div>
     <label class="field">
-      <span class="label">refuse to run <em>one pattern per line</em></span>
+      <span class="label">refuse to run <em>one substring per line</em></span>
       <textarea id="settings-deny" rows="3" class="mono" spellcheck="false"></textarea>
     </label>
+    <label class="field">
+      <span class="label">diff policy — paths <em>one glob per line; touching these needs review</em></span>
+      <textarea id="settings-policy-paths" rows="3" class="mono" spellcheck="false"></textarea>
+    </label>
+    <label class="field">
+      <span class="label">diff policy — added lines <em>one substring per line; adding these needs review</em></span>
+      <textarea id="settings-policy-lines" rows="3" class="mono" spellcheck="false"></textarea>
+    </label>
+    <div class="suggest" id="settings-policy-suggest" hidden>
+      <span class="label">suggested policy</span>
+      <div class="suggest-list" id="policy-suggest-list"></div>
+    </div>
     <div class="sheet-foot">
-      <span class="hint mono">esc to close</span>
+      <span class="hint mono">policy findings make a receipt say “needs review”; merging then asks for an explicit override</span>
       <span class="spacer"></span>
       <button type="button" class="btn ghost" id="settings-cancel">cancel</button>
       <button type="submit" class="btn primary">save</button>
@@ -168,6 +195,6 @@
 
 <div class="toast" id="toast" hidden></div>
 
-<script src="/app.js"></script>
+<script type="module" src="/js/app.js"></script>
 </body>
 </html>

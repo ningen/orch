@@ -62,13 +62,22 @@ pub struct TaskMeta {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Verify {
-    /// "passed" or "failed".
+    /// "passed", "failed", or "needs_review" (checks green, policy flagged).
     pub status: String,
     pub at: u64,
     /// Fingerprint of the working tree that produced this result.
     pub fingerprint: String,
+    /// The commit the task branch was at when this ran.
+    #[serde(default)]
+    pub head_sha: String,
+    /// The base branch commit it was evaluated against.
+    #[serde(default)]
+    pub base_sha: String,
     #[serde(default)]
     pub commands: Vec<Value>,
+    /// Diff-policy findings: what a human should look at before merging.
+    #[serde(default)]
+    pub policy: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -169,7 +178,8 @@ fn clean_title(raw: &str) -> String {
     if line.chars().count() > 72 {
         out = out.trim_end().to_string();
     }
-    out.trim_matches(|c: char| c == '.' || c == '。').to_string()
+    out.trim_matches(|c: char| c == '.' || c == '。')
+        .to_string()
 }
 
 fn fallback_title(prompt: &str) -> String {
@@ -190,7 +200,14 @@ fn fallback_title(prompt: &str) -> String {
 /// Pick a small model from the agent's catalogue for naming tasks.
 fn pick_title_model(options: &[Value]) -> Option<String> {
     let hints = [
-        "flash", "haiku", "mini", "small", "lightning", "lite", "nano", "free",
+        "flash",
+        "haiku",
+        "mini",
+        "small",
+        "lightning",
+        "lite",
+        "nano",
+        "free",
     ];
     for hint in hints {
         for option in options {
@@ -207,7 +224,6 @@ fn pick_title_model(options: &[Value]) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
 }
-
 
 fn dir_key(path: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -347,15 +363,24 @@ impl Orch {
     }
 
     /// Every workspace in a shape the UI can render directly.
+    ///
+    /// Tasks carry `behind` (how far the base branch has moved) so a client
+    /// can tell a stale receipt from a current one without loading each task.
     pub async fn summary(&self) -> Vec<Value> {
         let workspaces = self.workspaces.read().await;
         let mut out = Vec::with_capacity(workspaces.len());
         for ws in workspaces.values() {
-            let mut tasks: Vec<TaskMeta> = Vec::new();
+            let mut tasks: Vec<Value> = Vec::new();
             for task in ws.tasks.read().await.values() {
-                tasks.push(task.meta.read().await.clone());
+                let meta = task.meta.read().await.clone();
+                let behind = task.behind().await;
+                let mut value = serde_json::to_value(&meta).unwrap_or_default();
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("behind".into(), json!(behind));
+                }
+                tasks.push(value);
             }
-            tasks.sort_by_key(|m| m.created_at);
+            tasks.sort_by_key(|t| t.get("createdAt").and_then(Value::as_u64).unwrap_or(0));
             out.push(json!({
                 "path": ws.repo.path,
                 "name": ws.repo.name,
@@ -771,14 +796,29 @@ impl Task {
             ),
         )
         .await;
+        result.map_err(|_| anyhow!("naming the task timed out"))??;
 
-        *self.title_session.write().await = None;
-        let text = std::mem::take(&mut *self.title_buffer.lock().await);
+        // The reply has arrived, but the chunks that produced it travel a
+        // different path (the pump task) and may still be in its queue.
+        // Give them a moment to land in the buffer; otherwise the title is
+        // read as empty and a later chunk leaks into the main transcript.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let text;
+        loop {
+            let taken = std::mem::take(&mut *self.title_buffer.lock().await);
+            if !taken.is_empty() || tokio::time::Instant::now() >= deadline {
+                text = taken;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Keep `title_session` set: session ids are unique, so any straggler
+        // update for this session must keep flowing into the buffer rather
+        // than into the transcript.
         let _ = agent
             .request("session/close", json!({ "sessionId": sid }))
             .await;
-
-        result.map_err(|_| anyhow!("naming the task timed out"))??;
         Ok(clean_title(&text))
     }
 
@@ -858,6 +898,20 @@ impl Task {
             _ => self.set_status("done").await,
         }
         self.persist().await;
+
+        // A finished turn is review-ready only once the gate has spoken, so
+        // run the checks now instead of waiting for a human to click. A
+        // failing gate is the normal outcome sometimes — it is recorded, not
+        // fatal.
+        if stop != "refusal" && stop != "cancelled" {
+            let has_checks = match self.ws.upgrade() {
+                Some(ws) => !ws.settings.read().await.checks.is_empty(),
+                None => false,
+            };
+            if has_checks {
+                let _ = self.run_verify().await;
+            }
+        }
         Ok(())
     }
 
@@ -924,22 +978,20 @@ impl Task {
         // `on_update`.
         let mut session = Value::Null;
         let mut sid = String::new();
-        if can_load {
-            if let Some(previous) = meta.session_id.clone() {
-                self.replaying.store(true, Ordering::SeqCst);
-                let loaded = tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
-                    acp.request(
-                        "session/load",
-                        json!({ "sessionId": previous, "cwd": meta.worktree, "mcpServers": [] }),
-                    ),
-                )
-                .await;
-                self.replaying.store(false, Ordering::SeqCst);
-                if let Ok(Ok(value)) = loaded {
-                    session = value;
-                    sid = previous;
-                }
+        if can_load && let Some(previous) = meta.session_id.clone() {
+            self.replaying.store(true, Ordering::SeqCst);
+            let loaded = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                acp.request(
+                    "session/load",
+                    json!({ "sessionId": previous, "cwd": meta.worktree, "mcpServers": [] }),
+                ),
+            )
+            .await;
+            self.replaying.store(false, Ordering::SeqCst);
+            if let Ok(Ok(value)) = loaded {
+                session = value;
+                sid = previous;
             }
         }
 
@@ -1069,19 +1121,21 @@ impl Task {
                     json!({ "sessionId": sid, "configId": "model", "value": value }),
                 )
                 .await?;
-            if let Some(opts) = reply.get("configOptions").and_then(Value::as_array) {
-                if let Some(list) = opts
-                    .iter()
-                    .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
-                    .and_then(|o| o.get("options"))
-                    .and_then(Value::as_array)
-                {
-                    let mut m = self.meta.write().await;
-                    m.models = list.clone();
-                    let snapshot = m.clone();
-                    drop(m);
-                    self.emit(json!({ "type": "task", "task": snapshot }));
-                }
+            if let Some(list) = reply
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .and_then(|opts| {
+                    opts.iter()
+                        .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+                        .and_then(|o| o.get("options"))
+                        .and_then(Value::as_array)
+                })
+            {
+                let mut m = self.meta.write().await;
+                m.models = list.clone();
+                let snapshot = m.clone();
+                drop(m);
+                self.emit(json!({ "type": "task", "task": snapshot }));
             }
         }
         self.persist().await;
@@ -1430,6 +1484,68 @@ impl Task {
         }
     }
 
+    /// Record that the task landed on the base branch.
+    async fn mark_merged(&self) {
+        self.set_status("merged").await;
+    }
+
+    /// Scan the worktree diff against the repository's diff policy.
+    ///
+    /// Policy is evidence for a human, not a verdict: findings are attached
+    /// to the verify receipt and make it say `needs_review` even when every
+    /// check passed. Merging then needs an explicit override.
+    async fn policy_scan(&self, settings: &Settings) -> Result<Vec<Value>> {
+        if settings.policy_paths.is_empty() && settings.policy_lines.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (meta, _) = self.snapshot().await;
+        let wt = PathBuf::from(&meta.worktree);
+        let base = &meta.base;
+
+        let (_, paths_out, _) = git(&wt, &["diff", "--name-only", "-z", base]).await?;
+        let mut findings = Vec::new();
+        for path in paths_out.split('\0').filter(|p| !p.is_empty()) {
+            for pattern in &settings.policy_paths {
+                if crate::settings::glob_match(pattern, path) {
+                    findings.push(json!({
+                        "kind": "path",
+                        "pattern": pattern,
+                        "path": path,
+                    }));
+                }
+            }
+        }
+
+        if !settings.policy_lines.is_empty() {
+            let (_, diff, _) = git(&wt, &["diff", "-U0", base]).await?;
+            let mut file = String::new();
+            let mut hits: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for line in diff.lines() {
+                if let Some(rest) = line.strip_prefix("+++ b/") {
+                    file = rest.to_string();
+                } else if line.starts_with('+') && !line.starts_with("+++") {
+                    for pattern in &settings.policy_lines {
+                        if line.contains(pattern.as_str()) {
+                            hits.entry(pattern.clone()).or_default().push(file.clone());
+                        }
+                    }
+                }
+            }
+            for (pattern, files) in hits {
+                let mut unique = files;
+                unique.sort();
+                unique.dedup();
+                findings.push(json!({
+                    "kind": "line",
+                    "pattern": pattern,
+                    "path": unique.join(", "),
+                }));
+            }
+        }
+        Ok(findings)
+    }
+
     /// Run every configured check, in order, against the current worktree.
     pub async fn verify(self: &Arc<Self>) -> Result<()> {
         let (meta, _) = self.snapshot().await;
@@ -1473,6 +1589,14 @@ impl Task {
         // Flake evaluation reads the index, so make new files visible first.
         self.stage_intent().await.ok();
         let fingerprint = self.fingerprint().await;
+        let wt = PathBuf::from(&self.meta.read().await.worktree);
+        let (_, head_sha, _) = git(&wt, &["rev-parse", "HEAD"]).await?;
+        let meta_base = self.meta.read().await.base_ref.clone();
+        let base_sha = match git(&wt, &["rev-parse", &meta_base]).await {
+            Ok((true, out, _)) => out,
+            _ => String::new(),
+        };
+        let findings = self.policy_scan(&settings).await?;
 
         let id = format!("v_{}", uuid::Uuid::new_v4().simple());
         self.push_item(json!({
@@ -1483,10 +1607,32 @@ impl Task {
             "toolKind": "verify",
             "status": "in_progress",
             "locations": [],
-            "input": { "checks": settings.checks },
+            "input": {
+                "checks": settings.checks,
+                "policyPaths": settings.policy_paths,
+                "policyLines": settings.policy_lines,
+            },
             "output": "",
         }))
         .await;
+
+        if !findings.is_empty() {
+            let mut head = String::from("diff policy — needs a human look:\n");
+            for finding in &findings {
+                head.push_str(&format!(
+                    "  {} (pattern `{}`, path {})\n",
+                    finding["kind"].as_str().unwrap_or("?"),
+                    finding["pattern"].as_str().unwrap_or("?"),
+                    finding["path"].as_str().unwrap_or("?"),
+                ));
+            }
+            let snapshot = head.clone();
+            let item_id = id.clone();
+            self.patch_item(&item_id, move |item| {
+                item["output"] = json!(snapshot);
+            })
+            .await;
+        }
 
         let mut results = Vec::new();
         let mut transcript = String::new();
@@ -1521,7 +1667,13 @@ impl Task {
             }
         }
 
-        let status = if failed { "failed" } else { "passed" };
+        let status = if failed {
+            "failed"
+        } else if !findings.is_empty() {
+            "needs_review"
+        } else {
+            "passed"
+        };
         let label = status.to_string();
         let item_id = id.clone();
         self.patch_item(&item_id, move |item| {
@@ -1535,7 +1687,10 @@ impl Task {
                 status: status.to_string(),
                 at: now_ms(),
                 fingerprint: if failed { String::new() } else { fingerprint },
+                head_sha,
+                base_sha,
                 commands: results,
+                policy: findings,
             });
             meta.updated_at = now_ms();
             let snapshot = meta.clone();
@@ -1605,8 +1760,10 @@ impl Task {
     }
 
     /// Commit the worktree, refusing when checks are configured but have not
-    /// passed against exactly these contents.
-    async fn commit_worktree(&self) -> Result<TaskMeta> {
+    /// passed against exactly these contents. `force` overrides a
+    /// `needs_review` receipt (policy findings a human chose to accept);
+    /// it never overrides a failed check or a stale fingerprint.
+    async fn commit_worktree(&self, force: bool) -> Result<TaskMeta> {
         let (meta, _) = self.snapshot().await;
         if meta.worktree.is_empty() {
             return Err(anyhow!("this task has not started yet"));
@@ -1625,6 +1782,27 @@ impl Task {
             let fingerprint = self.fingerprint().await;
             match &meta.verify {
                 Some(v) if v.status == "passed" && v.fingerprint == fingerprint => {}
+                Some(v) if v.status == "needs_review" && v.fingerprint == fingerprint => {
+                    if !force {
+                        let findings = v
+                            .policy
+                            .iter()
+                            .map(|f| {
+                                format!(
+                                    "  {} `{}` in {}",
+                                    f.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                                    f.get("pattern").and_then(Value::as_str).unwrap_or("?"),
+                                    f.get("path").and_then(Value::as_str).unwrap_or("?"),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(anyhow!(
+                            "the diff policy flagged this change:\n{findings}\n\
+                             resolve it, verify again, or merge with an explicit override"
+                        ));
+                    }
+                }
                 Some(v) if v.status == "passed" => {
                     return Err(anyhow!(
                         "the worktree changed since the last passing check — verify again"
@@ -1648,8 +1826,17 @@ impl Task {
 
     /// Commit, then fast-forward the repository onto the task branch when it
     /// is safe to do so.
-    pub async fn merge(self: &Arc<Self>) -> Result<Value> {
-        let meta = self.commit_worktree().await?;
+    pub async fn merge(self: &Arc<Self>, force: bool) -> Result<Value> {
+        // A receipt describes one base. If the base moved, the receipt no
+        // longer describes what would land, so merge refuses and names the
+        // way back: rebase, then verify against the new base.
+        let behind = self.behind().await;
+        if behind > 0 {
+            return Err(anyhow!(
+                "the base branch moved ahead by {behind} commits — rebase and verify again before merging"
+            ));
+        }
+        let meta = self.commit_worktree(force).await?;
         let repo = self
             .ws
             .upgrade()
@@ -1676,6 +1863,18 @@ impl Task {
             let _ = git(&root, &["merge", "--abort"]).await;
             return Err(anyhow!("merge failed and was aborted:\n{err}"));
         }
+        if force {
+            self.push_item(json!({
+                "kind": "note",
+                "id": format!("n_{}", uuid::Uuid::new_v4().simple()),
+                "at": now_ms(),
+                "text": "merged with a policy override — the diff policy findings were accepted by a human",
+                "tone": "warn",
+            }))
+            .await;
+        }
+        self.mark_merged().await;
+        self.persist().await;
         Ok(json!({
             "ok": true,
             "merged": true,
@@ -1745,51 +1944,56 @@ fn chunk_text(update: &Value) -> String {
 
 fn merge_tool(item: &mut Value, update: &Value) {
     for key in ["title", "status"] {
-        if let Some(v) = update.get(key) {
-            if !v.is_null() {
-                item[key] = v.clone();
-            }
+        if let Some(v) = update.get(key).filter(|v| !v.is_null()) {
+            item[key] = v.clone();
         }
     }
-    if let Some(kind) = update.get("kind") {
-        if !kind.is_null() {
-            item["toolKind"] = kind.clone();
-        }
+    if let Some(kind) = update.get("kind").filter(|k| !k.is_null()) {
+        item["toolKind"] = kind.clone();
     }
-    if let Some(input) = update.get("rawInput") {
-        if input.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
-            item["input"] = input.clone();
-        }
+    if let Some(input) = update
+        .get("rawInput")
+        .filter(|i| i.as_object().map(|o| !o.is_empty()).unwrap_or(false))
+    {
+        item["input"] = input.clone();
     }
-    if let Some(locs) = update.get("locations").and_then(Value::as_array) {
-        let paths: Vec<Value> = locs.iter().filter_map(|l| l.get("path").cloned()).collect();
-        if !paths.is_empty() {
-            item["locations"] = json!(paths);
-        }
+    if let Some(paths) = update
+        .get("locations")
+        .and_then(Value::as_array)
+        .map(|locs| {
+            locs.iter()
+                .filter_map(|l| l.get("path").cloned())
+                .collect::<Vec<Value>>()
+        })
+        .filter(|paths: &Vec<Value>| !paths.is_empty())
+    {
+        item["locations"] = json!(paths);
     }
     let mut out = item["output"].as_str().unwrap_or("").to_string();
-    if let Some(raw) = update.get("rawOutput").and_then(|r| r.get("output")) {
-        if let Some(s) = raw.as_str() {
-            out = s.to_string();
-        }
+    if let Some(s) = update
+        .get("rawOutput")
+        .and_then(|r| r.get("output"))
+        .and_then(Value::as_str)
+    {
+        out = s.to_string();
     }
-    if out.is_empty() {
-        if let Some(content) = update.get("content").and_then(Value::as_array) {
-            let mut buf = String::new();
-            for block in content {
-                if let Some(text) = block
-                    .get("content")
-                    .and_then(|c| c.get("text"))
-                    .and_then(Value::as_str)
-                {
-                    if !buf.is_empty() {
-                        buf.push('\n');
-                    }
-                    buf.push_str(text);
+    if out.is_empty()
+        && let Some(content) = update.get("content").and_then(Value::as_array)
+    {
+        let mut buf = String::new();
+        for block in content {
+            if let Some(text) = block
+                .get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str)
+            {
+                if !buf.is_empty() {
+                    buf.push('\n');
                 }
+                buf.push_str(text);
             }
-            out = buf;
         }
+        out = buf;
     }
     item["output"] = json!(out);
 }
