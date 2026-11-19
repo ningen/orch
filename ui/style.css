@@ -547,6 +547,7 @@ button:disabled { opacity: .4; cursor: default; }
 }
 .item.note.warn { border-color: #3d3220; color: #d3ab74; background: #16130d; }
 .item.note.error { border-color: #3c2020; color: var(--bad); background: #150e0f; }
+.item.note.info { border-color: #20303c; color: #74a6d3; background: #0d1215; }
 
 .caret {
   display: inline-block;

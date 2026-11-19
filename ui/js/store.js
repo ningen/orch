@@ -30,31 +30,48 @@ export function repoTasks() {
   return repo ? [...repo.tasks.values()].sort((a, b) => a.createdAt - b.createdAt) : [];
 }
 
+/**
+ * What the last receipt says about this task's work. The server ships its
+ * verdict as `task.receiptState` (see src/receipt.rs — one state machine,
+ * consumed everywhere); this fallback re-derives it only when a payload
+ * predates that field.
+ */
+export function receiptState(task, behind, gated) {
+  if (task.receiptState) return task.receiptState;
+  const verify = task.verify;
+  if (!verify) return gated ? "unverified" : "ungated";
+  if (verify.status === "failed") return "failed";
+  if (verify.status === "needs_review") return "needs_review";
+  return behind > 0 ? "stale" : "passed";
+}
+
 /** Attention classification: what makes a task worth a human's next look. */
 export function classify(task) {
   const behind = state.behind[task.id] || 0;
   if (task.status === "error") {
     return { kind: "error", rank: 0, reason: "agent error" };
   }
-  const verify = task.verify;
-  if (verify && verify.status === "failed") {
-    return { kind: "failed", rank: 1, reason: "verify failed" };
+  const gated = Boolean(state.settings && (state.settings.checks || []).length);
+  switch (receiptState(task, behind, gated)) {
+    case "failed":
+      return { kind: "failed", rank: 1, reason: "verify failed" };
+    case "needs_review":
+      return { kind: "policy", rank: 2, reason: "policy — needs review" };
+    case "stale":
+      return { kind: "stale", rank: 3, reason: `base moved +${behind}` };
+    case "unverified":
+      if (task.status === "done") {
+        return { kind: "review", rank: 4, reason: "done — not verified" };
+      }
+      return null;
+    case "ungated":
+      if (task.status === "done") {
+        return { kind: "review", rank: 5, reason: "done — no gate configured" };
+      }
+      return null;
+    default:
+      return null; // "passed": calm, nothing needed
   }
-  if (verify && verify.status === "needs_review") {
-    return { kind: "policy", rank: 2, reason: "policy — needs review" };
-  }
-  if (verify && verify.status === "passed" && behind > 0) {
-    return { kind: "stale", rank: 3, reason: `base moved +${behind}` };
-  }
-  if (task.status === "done" && !verify) {
-    const gated = state.settings && (state.settings.checks || []).length > 0;
-    return {
-      kind: "review",
-      rank: gated ? 4 : 5,
-      reason: gated ? "done — not verified" : "done — no gate configured",
-    };
-  }
-  return null;
 }
 
 /** The inbox order: attention first (rank, then newest), calm below. */
@@ -117,7 +134,6 @@ export function nextAction(task, behind, gated) {
   }
   const alt = (id, label) => ({ id, label });
   const started = Boolean(task.branch || task.sessionId);
-  const verify = task.verify;
 
   if (task.status === "error") {
     return {
@@ -127,40 +143,41 @@ export function nextAction(task, behind, gated) {
       alternatives: [alt("open", "read the transcript")],
     };
   }
-  if (verify && verify.status === "failed") {
-    return {
-      id: "instruct",
-      label: "send back",
-      why: "a check failed — the receipt has the output",
-      alternatives: [alt("open", "see the receipt"), alt("verify", "run verify again")],
-    };
-  }
-  if (verify && verify.status === "needs_review") {
-    const n = (verify.policy || []).length;
-    return {
-      id: "merge",
-      label: "accept & merge",
-      confirm: true,
-      why: `checks green · policy flagged ${n} finding${n === 1 ? "" : "s"}`,
-      alternatives: [alt("open", "see the findings"), alt("instruct", "send back")],
-    };
-  }
-  if (verify && verify.status === "passed" && behind > 0) {
-    return {
-      id: "rebase",
-      label: `rebase +${behind}`,
-      why: `the base moved ${behind} commit${behind === 1 ? "" : "s"} — the receipt is stale`,
-      alternatives: [alt("open", "open the task")],
-    };
-  }
-  if (verify && verify.status === "passed") {
-    return {
-      id: "merge",
-      label: "merge",
-      confirm: true,
-      why: "checks passed against the current base",
-      alternatives: [alt("open", "see the diff"), alt("instruct", "send back")],
-    };
+  switch (receiptState(task, behind, gated)) {
+    case "failed":
+      return {
+        id: "instruct",
+        label: "send back",
+        why: "a check failed — the receipt has the output",
+        alternatives: [alt("open", "see the receipt"), alt("verify", "run verify again")],
+      };
+    case "needs_review": {
+      const n = (task.verify && task.verify.policy || []).length;
+      return {
+        id: "merge",
+        label: "accept & merge",
+        confirm: true,
+        why: `checks green · policy flagged ${n} finding${n === 1 ? "" : "s"}`,
+        alternatives: [alt("open", "see the findings"), alt("instruct", "send back")],
+      };
+    }
+    case "stale":
+      return {
+        id: "rebase",
+        label: `rebase +${behind}`,
+        why: `the base moved ${behind} commit${behind === 1 ? "" : "s"} — the receipt is stale`,
+        alternatives: [alt("open", "open the task")],
+      };
+    case "passed":
+      return {
+        id: "merge",
+        label: "merge",
+        confirm: true,
+        why: "checks passed against the current base",
+        alternatives: [alt("open", "see the diff"), alt("instruct", "send back")],
+      };
+    default:
+      break;
   }
   if (!started) {
     return {
@@ -170,7 +187,7 @@ export function nextAction(task, behind, gated) {
       alternatives: [],
     };
   }
-  if (gated) {
+  if (receiptState(task, behind, gated) === "unverified") {
     return {
       id: "verify",
       label: "verify",

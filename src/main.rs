@@ -5,6 +5,7 @@
 //! repositories open at once.
 
 mod acp;
+mod receipt;
 mod server;
 mod settings;
 mod task;

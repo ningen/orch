@@ -97,6 +97,33 @@ $ true
 権限リクエストを送ってこない）。確実に防ぎたいなら実行環境側（`nix develop` の
 PATH、コンテナ、bwrap）で縛る必要がある。
 
+## autopilot — 決められるものは決めて、必要なものだけ人間へ
+
+エージェントがターンを終えたあと、もう一つ人が押すだけのボタン（rebase、再検証、
+merge）がある。autopilot はそのうち **証拠だけから決まるものをシステムが代わりに
+押す**。判断の材料はカードの推奨と同一の状態マシン（`src/receipt.rs`）で、
+エージェントの自己申告は一切使わない。何を決めたかは note として transcript に残る。
+
+gate 設定（verify パネル）でモードを選ぶ:
+
+| モード | システムが自分で決めること |
+| --- | --- |
+| `off` | 何もしない。すべて人の操作 |
+| `keep-fresh`（既定） | base が動いていれば rebase し、検証がなければ（or worktree が変わっていれば）verify を回す |
+| `auto-merge` | keep-fresh に加え、**gate が設定され、checks が green で、policy 違反がゼロ**なら merge まで |
+
+システムが**決めない**もの: 検証失敗への対処、`needs_review` の受け入れ
+（policy override は必ず人の confirm）、gate のないリポジトリでの merge、
+rebase の衝突解決。これらはそのまま attention カードに届く。
+
+## receiptState — 状態マシンの一元化
+
+「この worktree の作業は今どうなっているか」を1つの enum に定義し、Rust の merge
+ゲート・autopilot・UI のカード分類が**同じ定義**を消費する
+（`failed / needs_review / stale / passed / unverified / ungated`）。
+UI は `GET /api/state` と `GET /api/tasks/{id}` が返す `receiptState` をそのまま使い、
+古いペイロードへの互換用のローカル導出だけをフォールバックに持つ。
+
 ## その他の操作
 
 | 操作 | 場所 | 内容 |
@@ -133,9 +160,16 @@ ui/            ブラウザ UI（ビルド不要、バイナリに埋め込み�
   js/inbox.js    監督 inbox（例外カード・quiet list・カード内アクション）
   js/task.js     会話レンズ（transcript / composer / inspector）
   js/modals.js   repo picker と gate 設定
-  js/store.js    共有状態と attention の分類
+  js/store.js    共有状態と attention の分類（receiptState を消費）
+  store.test.js  純関数のテスト（node --test "ui/*.test.js"）
 src/acp.rs     ACP クライアント（子プロセスと JSON-RPC over stdio）
-src/task.rs    タスク = worktree + セッション + receipt + イベント配信 + 永続化
+src/receipt.rs 状態マシンの一元定義（receiptState / autopilot の決定表）
+src/task/      タスク = worktree + セッション + receipt + イベント配信 + 永続化
+  mod.rs         型と会話コア（ターン・パンプ・永続化）
+  workspace.rs   リポジトリの登録と復元
+  git.rs         worktree 操作（fingerprint / rebase / merge / gate）
+  verify.rs      検証ゲートとコマンド実行
+  autopilot.rs   ターン後の自動判断（決められるものだけ決める）
 src/server.rs  axum: JSON API / SSE / 埋め込みアセット
 src/main.rs    CLI
 ```
@@ -159,7 +193,11 @@ src/main.rs    CLI
   base moved / 未検証）を優先度順に並べ、quiet は 1 行に畳む
 - **next action の提示と選択**: カードは receipt と git 状態から決まる推奨行動を
   1 つ提示し、代替とともに選ばせる（`1`–`3`）。推奨は agent の自己申告を信用せず
-  決定論的に出す。merge だけは常に confirm を挟む
+  決定論的に出す（状態マシンは `src/receipt.rs` に一元化、サーバーが verdict を配る）。
+  merge だけは常に confirm を挟む
+- **autopilot**: ターン終了後、証拠だけから決まるとおりにシステムが rebase・verify
+  （設定次第で merge まで）を進める。判断が要るものだけ attention カードに届く。
+  決定内容は note で transcript に残る（`off / keep-fresh / auto-merge`）
 - ターン終了後の自動 verify と receipt（head/base SHA、各コマンド結果）
 - diff policy（paths / added lines）と、override 明示付きの merge
 - base が動いたタスクの merge 拒否（rebase → verify → merge）

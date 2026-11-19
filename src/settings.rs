@@ -24,6 +24,17 @@ pub struct Settings {
     /// Substrings for added lines that should flag the change for review.
     #[serde(default, alias = "policyLines")]
     pub policy_lines: Vec<String>,
+    /// How much the system decides on its own after a turn ends:
+    /// "off", "keep-fresh" (rebase + re-verify), or "auto-merge".
+    /// See `crate::receipt::AutopilotMode`.
+    #[serde(default = "default_autopilot")]
+    pub autopilot: String,
+}
+
+fn default_autopilot() -> String {
+    crate::receipt::AutopilotMode::KeepFresh
+        .as_str()
+        .to_string()
 }
 
 fn default_deny() -> Vec<String> {
@@ -182,11 +193,13 @@ mod tests {
             deny: default_deny(),
             policy_paths: vec![".github/workflows/*".into()],
             policy_lines: vec!["#[ignore]".into()],
+            autopilot: "auto-merge".into(),
         };
         settings.save(&dir).unwrap();
         let loaded = Settings::load(&dir);
         assert_eq!(loaded.policy_paths, settings.policy_paths);
         assert_eq!(loaded.policy_lines, settings.policy_lines);
+        assert_eq!(loaded.autopilot, "auto-merge");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -203,6 +216,8 @@ mod tests {
         assert_eq!(loaded.checks, vec!["cargo test".to_string()]);
         assert!(loaded.policy_paths.is_empty());
         assert!(loaded.policy_lines.is_empty());
+        // Missing fields fall back to their defaults, never to "off".
+        assert_eq!(loaded.autopilot, "keep-fresh");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

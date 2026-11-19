@@ -235,9 +235,16 @@ async fn show(State(orch): State<Arc<Orch>>, Path(id): Path<String>) -> Api<Valu
     let task = need_task(&orch, &id).await?;
     let (meta, items) = task.snapshot().await;
     let behind = task.behind().await;
+    let state = task.receipt_state_with(behind).await;
     let items = items.iter().map(light_item).collect::<Vec<_>>();
+    let mut task_value = serde_json::to_value(&meta).unwrap_or_default();
+    if let Some(obj) = task_value.as_object_mut() {
+        // The task JSON carries the server's verdict, so the client consumes
+        // the state machine instead of re-deriving it.
+        obj.insert("receiptState".into(), json!(state.as_str()));
+    }
     Ok(Json(
-        json!({ "task": meta, "items": items, "behind": behind }),
+        json!({ "task": task_value, "items": items, "behind": behind }),
     ))
 }
 
@@ -456,6 +463,7 @@ async fn get_settings(
         "deny": settings.deny,
         "policyPaths": settings.policy_paths,
         "policyLines": settings.policy_lines,
+        "autopilot": settings.autopilot,
         "suggested": suggested,
         "suggestedPolicyPaths": policy_paths,
         "suggestedPolicyLines": policy_lines,
@@ -475,6 +483,8 @@ struct SettingsBody {
     policy_paths: Vec<String>,
     #[serde(default)]
     policy_lines: Vec<String>,
+    #[serde(default)]
+    autopilot: Option<String>,
 }
 
 async fn put_settings(State(orch): State<Arc<Orch>>, Json(body): Json<SettingsBody>) -> Api<Value> {
@@ -503,6 +513,15 @@ async fn put_settings(State(orch): State<Arc<Orch>>, Json(body): Json<SettingsBo
         deny: clean_patterns(body.deny),
         policy_paths: clean_patterns(body.policy_paths),
         policy_lines: clean_patterns(body.policy_lines),
+        // An absent or unknown value keeps the mode at its default.
+        autopilot: body
+            .autopilot
+            .map(|value| {
+                crate::receipt::AutopilotMode::parse(&value)
+                    .as_str()
+                    .to_string()
+            })
+            .unwrap_or_else(default_settings_autopilot),
     };
     settings.save(&ws.dir)?;
     *ws.settings.write().await = settings.clone();
@@ -511,7 +530,14 @@ async fn put_settings(State(orch): State<Arc<Orch>>, Json(body): Json<SettingsBo
         "deny": settings.deny,
         "policyPaths": settings.policy_paths,
         "policyLines": settings.policy_lines,
+        "autopilot": settings.autopilot,
     })))
+}
+
+fn default_settings_autopilot() -> String {
+    crate::receipt::AutopilotMode::KeepFresh
+        .as_str()
+        .to_string()
 }
 
 /* ------------------------------------------------------------------ events */

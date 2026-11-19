@@ -30,6 +30,8 @@ type Task = {
   baseRef: string;     // branch this task was cut from
   sessionId: string | null; // agent session, reused after a restart
   verify: Verify | null;
+  receiptState?: "failed" | "needs_review" | "stale" | "passed" | "unverified" | "ungated";
+  behind?: number;           // commits the base branch is ahead (list responses)
 };
 
 // A verify run is a receipt: it names the commits it describes.
@@ -74,7 +76,7 @@ type Item =
 | POST | `/api/repos/current` | `{ path }` | switch to an already-open repository |
 | DELETE | `/api/repos` | `{ path }` | close a repository |
 | GET | `/api/browse?path=` | – | `{ path, parent, dirs: [{ name, path, repo }] }` |
-| GET | `/api/tasks/{id}` | – | `{ task, items: Item[], behind }` — tool items ship without `input`/`output` (`bodyOmitted: true`); fetch the body only when someone opens it |
+| GET | `/api/tasks/{id}` | – | `{ task, items: Item[], behind }` — the task carries the server's `receiptState` verdict; tool items ship without `input`/`output` (`bodyOmitted: true`), fetch the body only when someone opens it |
 | GET | `/api/tasks/{id}/items/{itemId}` | – | one full `Item`, including a tool's `input` and `output` |
 | POST | `/api/tasks` | `{ title?, prompt?, model?, repo? }` | `{ task, items, repo }` |
 | POST | `/api/tasks/{id}/prompt` | `{ text }` | `{ ok: true }` |
@@ -87,8 +89,8 @@ type Item =
 | DELETE | `/api/tasks/{id}` | – | `{ ok: true }` |
 | GET | `/api/tasks/{id}/diff` | – | `{ stat, diff }` (unified diff vs. merge base) |
 | POST | `/api/tasks/{id}/run` | `{ command }` | `{ ok: true }` (output arrives on SSE) |
-| GET | `/api/settings?repo=` | – | `{ repo, dir, checks, deny, policyPaths, policyLines, suggested, suggestedPolicyPaths, suggestedPolicyLines }` |
-| PUT | `/api/settings` | `{ repo?, checks, deny, policyPaths, policyLines }` | same shape as `GET` |
+| GET | `/api/settings?repo=` | – | `{ repo, dir, checks, deny, policyPaths, policyLines, autopilot, suggested, suggestedPolicyPaths, suggestedPolicyLines }` |
+| PUT | `/api/settings` | `{ repo?, checks, deny, policyPaths, policyLines, autopilot? }` | same shape as `GET` |
 | GET | `/api/events` | – | `text/event-stream` |
 
 `RepoSummary` is what `/api/state` returns per open repository:
@@ -99,7 +101,7 @@ type RepoSummary = {
   name: string;      // last path component
   branch: string;    // current HEAD branch
   tasks: (Task & { behind: number })[];  // commits the base has that the task does not
-};
+};                                        // each task also carries receiptState
 ```
 
 Several repositories can be open at once. Their agent sessions keep running
@@ -140,10 +142,16 @@ Clients should reconnect automatically (EventSource does this) and re-fetch
   the repo's default branch, so it shows everything the task changed.
 - `GET /api/tasks/{id}` also returns `behind`: how many commits the base branch
   has that this task does not. `/api/state` carries the same number per task.
-- When a turn ends normally and checks are configured, verify runs
-  automatically: the receipt arrives on SSE without a human clicking. A
-  receipt names the `headSha` and `baseSha` it describes; a passing receipt
-  whose base has moved (`behind > 0`) is stale and `merge` refuses it.
+- When a turn ends normally, the autopilot runs: rebase onto a moved base,
+  verify, and (mode permitting) merge — each decided from the receipt state
+  and the gate, never from what the agent says. Every decision is recorded as
+  a `note` item. `autopilot` is `"off" | "keep-fresh" (default) | "auto-merge"`;
+  `auto-merge` never merges without a configured gate, with findings, or on a
+  failed check — those stay human decisions.
+- `receiptState` is the server's one verdict per task
+  (`src/receipt.rs`), served in list and task payloads. Clients should consume
+  it instead of re-deriving the state machine; a local derivation is only a
+  fallback for older payloads.
 - Verification settings live in the daemon's state directory
   (`<project>/settings.json`), never in the repository: an agent must not be
   able to edit the gate that judges it. `suggested` is a guess derived from

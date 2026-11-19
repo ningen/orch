@@ -149,6 +149,7 @@ export function openSettings() {
   $("settings-deny").value = (settings.deny || []).join("\n");
   $("settings-policy-paths").value = (settings.policyPaths || []).join("\n");
   $("settings-policy-lines").value = (settings.policyLines || []).join("\n");
+  $("settings-autopilot").value = settings.autopilot || "keep-fresh";
 
   const wrap = $("settings-suggest");
   const list = $("suggest-list");
@@ -214,6 +215,7 @@ async function saveSettings(event) {
         deny: lines("settings-deny"),
         policyPaths: lines("settings-policy-paths"),
         policyLines: lines("settings-policy-lines"),
+        autopilot: $("settings-autopilot").value,
       }),
     });
     await onSettingsChanged();
